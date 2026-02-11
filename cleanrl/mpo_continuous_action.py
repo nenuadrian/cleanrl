@@ -897,14 +897,18 @@ if __name__ == "__main__":
     )
     replay = MPOReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, capacity=args.buffer_size)
 
-    start_time = time.time()
     obs, _ = env.reset(seed=args.seed)
     obs = flatten_obs(obs)
     episode_return = 0.0
     episode_length = 0
+    train_start_time: float | None = None
 
     try:
         for global_step in range(1, args.total_timesteps + 1):
+            if train_start_time is None and global_step >= args.learning_starts:
+                train_start_time = time.time()
+            train_step = max(0, global_step - args.learning_starts)
+
             if global_step < args.learning_starts:
                 action_exec = env.action_space.sample().astype(np.float32)
                 action_raw = np.copy(action_exec)
@@ -932,8 +936,9 @@ if __name__ == "__main__":
 
             if terminated or truncated:
                 print(f"global_step={global_step}, episodic_return={episode_return}")
-                writer.add_scalar("charts/episodic_return", episode_return, global_step)
-                writer.add_scalar("charts/episodic_length", episode_length, global_step)
+                if train_step > 0:
+                    writer.add_scalar("charts/episodic_return", episode_return, train_step)
+                    writer.add_scalar("charts/episodic_length", episode_length, train_step)
                 obs, _ = env.reset()
                 obs = flatten_obs(obs)
                 episode_return = 0.0
@@ -950,14 +955,18 @@ if __name__ == "__main__":
 
                     metrics = agent.update(batch)
                     for key, value in metrics.items():
-                        writer.add_scalar(key, value, global_step)
+                        writer.add_scalar(key, value, train_step)
 
-            if global_step % 100 == 0:
-                sps = int(global_step / max(1e-8, time.time() - start_time))
+            if train_step > 0 and train_step % 100 == 0 and train_start_time is not None:
+                sps = int(train_step / max(1e-8, time.time() - train_start_time))
                 print("SPS:", sps)
-                writer.add_scalar("charts/SPS", sps, global_step)
+                writer.add_scalar("charts/SPS", sps, train_step)
 
-            if args.eval_interval > 0 and global_step % args.eval_interval == 0:
+            if (
+                args.eval_interval > 0
+                and train_step > 0
+                and train_step % args.eval_interval == 0
+            ):
                 eval_metrics = evaluate(
                     agent=agent,
                     env_id=args.env_id,
@@ -965,9 +974,10 @@ if __name__ == "__main__":
                     n_episodes=args.eval_episodes,
                 )
                 for key, value in eval_metrics.items():
-                    writer.add_scalar(key, value, global_step)
+                    writer.add_scalar(key, value, train_step)
                 print(
-                    f"eval step={global_step} mean={eval_metrics['eval/return_mean']:.3f} "
+                    f"eval step={train_step} (global={global_step}) "
+                    f"mean={eval_metrics['eval/return_mean']:.3f} "
                     f"std={eval_metrics['eval/return_std']:.3f}"
                 )
 
