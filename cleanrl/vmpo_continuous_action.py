@@ -13,6 +13,8 @@ import tyro
 from torch.distributions import Normal
 from torch.utils.tensorboard import SummaryWriter
 
+from cleanrl_utils.evals.mpo_eval import evaluate
+
 
 @dataclass
 class Args:
@@ -32,6 +34,12 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    save_model: bool = False
+    """whether to save model into the `runs/{run_name}` folder"""
+    upload_model: bool = False
+    """whether to upload the saved model to huggingface"""
+    hf_entity: str = ""
+    """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
@@ -56,8 +64,6 @@ class Args:
 
     gamma: float = 0.99
     """discount factor"""
-    normalize_advantages: bool = True
-    """whether to normalize advantages"""
     topk_fraction: float = 0.5
     """fraction of highest-advantage samples used in E-step"""
     temperature_init: float = 1.0
@@ -76,7 +82,7 @@ class Args:
     """policy network learning rate"""
     value_lr: float = 1e-3
     """value network learning rate"""
-    max_grad_norm: float = 10.0
+    max_grad_norm: float = 1.0
     """maximum gradient clipping norm"""
 
     popart_beta: float = 3e-4
@@ -87,20 +93,6 @@ class Args:
     """PopArt minimum sigma"""
 
 
-def _transform_observation(env: gym.Env, fn):
-    try:
-        return gym.wrappers.TransformObservation(env, fn)
-    except TypeError:
-        return gym.wrappers.TransformObservation(env, fn, env.observation_space)
-
-
-def _transform_reward(env: gym.Env, fn):
-    try:
-        return gym.wrappers.TransformReward(env, fn)
-    except TypeError:
-        return gym.wrappers.TransformReward(env, fn, env.reward_range)
-
-
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
         if capture_video and idx == 0:
@@ -108,13 +100,15 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env)
+        env = gym.wrappers.FlattenObservation(
+            env
+        )  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
-        env = _transform_observation(env, lambda obs: np.clip(obs, -10, 10))
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
         env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        env = _transform_reward(env, lambda reward: np.clip(reward, -10, 10))
+        env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         return env
 
     return thunk
@@ -356,7 +350,6 @@ class SquashedGaussianPolicy(nn.Module):
 
 @dataclass
 class VMPOConfig:
-    normalize_advantages: bool = True
     gamma: float = 0.99
     policy_lr: float = 5e-4
     value_lr: float = 1e-3
@@ -442,6 +435,26 @@ class VMPOAgent:
             eps=1e-5,
         )
 
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "policy": self.policy.state_dict(),
+            "log_temperature": self.log_temperature.detach().cpu(),
+            "log_alpha_mu": self.log_alpha_mu.detach().cpu(),
+            "log_alpha_sigma": self.log_alpha_sigma.detach().cpu(),
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self.policy.load_state_dict(state_dict["policy"])
+        self.log_temperature.data.copy_(
+            torch.as_tensor(state_dict["log_temperature"], device=self.device)
+        )
+        self.log_alpha_mu.data.copy_(
+            torch.as_tensor(state_dict["log_alpha_mu"], device=self.device)
+        )
+        self.log_alpha_sigma.data.copy_(
+            torch.as_tensor(state_dict["log_alpha_sigma"], device=self.device)
+        )
+
     def act(
         self,
         obs: np.ndarray,
@@ -494,11 +507,6 @@ class VMPOAgent:
 
         returns_raw = batch["returns"].squeeze(-1)
         advantages = batch["advantages"].squeeze(-1)
-
-        if self.config.normalize_advantages:
-            advantages = (advantages - advantages.mean()) / (
-                advantages.std(unbiased=False) + 1e-8
-            )
 
         with torch.no_grad():
             params_before = nn.utils.parameters_to_vector(
@@ -715,52 +723,6 @@ def compute_returns(
     return returns
 
 
-@torch.no_grad()
-def evaluate(
-    agent: VMPOAgent,
-    env_id: str,
-    seed: int,
-    gamma: float,
-    n_episodes: int = 10,
-) -> Dict[str, float]:
-    eval_envs = gym.vector.SyncVectorEnv(
-        [make_env(env_id, i, False, "eval", gamma) for i in range(n_episodes)]
-    )
-
-    obs, _ = eval_envs.reset(seed=seed)
-    episode_returns = np.zeros(n_episodes, dtype=np.float32)
-    final_returns = []
-    dones = np.zeros(n_episodes, dtype=bool)
-
-    while len(final_returns) < n_episodes:
-        obs = flatten_obs(obs)
-        action, _, _, _ = agent.act(obs, deterministic=True)
-        action = np.clip(
-            action,
-            eval_envs.single_action_space.low,
-            eval_envs.single_action_space.high,
-        )
-        next_obs, reward, terminated, truncated, _ = eval_envs.step(action)
-        episode_returns += reward
-
-        done = np.asarray(terminated) | np.asarray(truncated)
-        for i in range(n_episodes):
-            if not dones[i] and done[i]:
-                final_returns.append(float(episode_returns[i]))
-                dones[i] = True
-
-        obs = next_obs
-
-    eval_envs.close()
-
-    return {
-        "eval/return_mean": float(np.mean(final_returns)),
-        "eval/return_std": float(np.std(final_returns)),
-        "eval/return_min": float(np.min(final_returns)),
-        "eval/return_max": float(np.max(final_returns)),
-    }
-
-
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -810,7 +772,6 @@ if __name__ == "__main__":
     act_dim = int(np.prod(envs.single_action_space.shape))
 
     config = VMPOConfig(
-        normalize_advantages=args.normalize_advantages,
         gamma=args.gamma,
         policy_lr=args.policy_lr,
         value_lr=args.value_lr,
@@ -987,16 +948,56 @@ if __name__ == "__main__":
             if args.eval_interval > 0 and global_step % args.eval_interval == 0:
                 eval_metrics = evaluate(
                     agent=agent,
+                    make_env=make_env,
+                    flatten_obs=flatten_obs,
                     env_id=args.env_id,
                     seed=args.seed + 1000,
                     gamma=args.gamma,
                     n_episodes=args.eval_episodes,
+                    vectorized=True,
                 )
                 for key, value in eval_metrics.items():
                     writer.add_scalar(key, value, global_step)
                 print(
                     f"eval step={global_step} mean={eval_metrics['eval/return_mean']:.3f} "
                     f"std={eval_metrics['eval/return_std']:.3f}"
+                )
+
+        if args.save_model:
+            model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+            torch.save(agent.state_dict(), model_path)
+            print(f"model saved to {model_path}")
+
+            _, episodic_returns = evaluate(
+                agent=agent,
+                make_env=make_env,
+                flatten_obs=flatten_obs,
+                env_id=args.env_id,
+                seed=args.seed + 1000,
+                gamma=args.gamma,
+                n_episodes=10,
+                run_name=f"{run_name}-eval",
+                capture_video=True,
+                vectorized=True,
+                return_episode_returns=True,
+            )
+            for idx, episodic_return in enumerate(episodic_returns):
+                writer.add_scalar("eval/episodic_return", episodic_return, idx)
+
+            if args.upload_model:
+                from cleanrl_utils.huggingface import push_to_hub
+
+                repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
+                repo_id = (
+                    f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
+                )
+                push_to_hub(
+                    args,
+                    episodic_returns,
+                    repo_id,
+                    "VMPO",
+                    f"runs/{run_name}",
+                    f"videos/{run_name}-eval",
                 )
 
     finally:
