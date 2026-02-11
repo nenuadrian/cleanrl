@@ -800,8 +800,7 @@ if __name__ == "__main__":
         [
             make_env(args.env_id, i, args.capture_video, run_name, args.gamma)
             for i in range(args.num_envs)
-        ],
-        autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
+        ]
     )
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
