@@ -55,7 +55,6 @@ def evaluate(
         returns = []
         eval_env = make_env(
             env_id,
-            seed=seed,
             idx=0,
             capture_video=capture_video,
             run_name=run_name,

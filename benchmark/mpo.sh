@@ -5,7 +5,7 @@ OMP_NUM_THREADS=1 xvfb-run -a python -m cleanrl_utils.benchmark \
     --env-ids HalfCheetah-v4 Walker2d-v4 Hopper-v4 InvertedPendulum-v4 Humanoid-v4 Pusher-v4 \
     --command "uv run python cleanrl/mpo_continuous_action.py --track --capture_video" \
     --num-seeds 1 \
-    --workers 2 
+    --workers 6 
 
 uv pip install ".[mujoco, dm_control]"
 OMP_NUM_THREADS=1 xvfb-run -a uv run python -m cleanrl_utils.benchmark \
