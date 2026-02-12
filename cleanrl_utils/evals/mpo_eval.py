@@ -52,6 +52,10 @@ def evaluate(
         finally:
             eval_envs.close()
     else:
+        if gamma is None:
+            raise ValueError(
+                "gamma must be provided for non-vectorized evaluation when make_env uses reward normalization."
+            )
         returns = []
         eval_env = make_env(
             env_id,

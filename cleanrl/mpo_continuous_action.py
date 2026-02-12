@@ -1113,6 +1113,7 @@ if __name__ == "__main__":
                     flatten_obs=flatten_obs,
                     env_id=args.env_id,
                     seed=args.seed + 1000,
+                    gamma=args.gamma,
                     n_episodes=args.eval_episodes,
                 )
                 for key, value in eval_metrics.items():
@@ -1134,6 +1135,7 @@ if __name__ == "__main__":
                 flatten_obs=flatten_obs,
                 env_id=args.env_id,
                 seed=args.seed + 1000,
+                gamma=args.gamma,
                 n_episodes=10,
                 run_name=f"{run_name}-eval",
                 capture_video=True,
