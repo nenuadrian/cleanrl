@@ -5,7 +5,7 @@ uv run python -m cleanrl_utils.benchmark \
     --env-ids HalfCheetah-v4 Walker2d-v4 Hopper-v4 InvertedPendulum-v4 Humanoid-v4 Pusher-v4 \
     --command "uv run python cleanrl/vmpo_continuous_action.py --track --capture_video" \
     --num-seeds 1 \
-    --workers 5
+    --workers 3
 
 uv pip install ".[mujoco, dm_control]"
 uv run python -m cleanrl_utils.benchmark \

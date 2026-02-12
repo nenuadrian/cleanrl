@@ -100,7 +100,7 @@ class Args:
     """max gradient norm for clipping"""
 
     # Optional retrace targets
-    use_retrace: bool = False
+    use_retrace: bool = True
     """whether to use Retrace targets"""
     retrace_steps: int = 2
     """sequence length for Retrace"""
