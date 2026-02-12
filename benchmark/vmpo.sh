@@ -2,54 +2,43 @@
 
 uv pip install ".[mujoco]"
 uv run python -m cleanrl_utils.benchmark \
-    --env-ids HalfCheetah-v4 Walker2d-v4 Hopper-v4 Humanoid-v4 Pusher-v4 \
-    --command "uv run python cleanrl/vmpo_continuous_action.py --track --capture_video --wandb_project_name cleanrl-bench-1" \
-    --num-seeds 1 \
+    --env-ids HalfCheetah-v4 Walker2d-v4 Hopper-v4 Humanoid-v4  \
+    --command "uv run python cleanrl/vmpo_continuous_action.py --track --capture_video --wandb_project_name cleanrl-bench-3" \
+    --num-seeds 2 \
     --workers 2
 
 uv pip install ".[mujoco, dm_control]"
 uv run python -m cleanrl_utils.benchmark \
-    --env-ids dm_control/cartpole-balance-v0 dm_control/cheetah-run-v0 dm_control/dog-walk-v0 dm_control/dog-run-v0 dm_control/hopper-hop-v0 dm_control/humanoid-walk-v0 dm_control/humanoid-run-v0 dm_control/humanoid-run_pure_state-v0 dm_control/humanoid_CMU-run-v0 dm_control/walker-walk-v0 dm_control/walker-run-v0 \
-    --command "uv run python cleanrl/vmpo_continuous_action.py --track --wandb_project_name cleanrl-bench-1" \
-    --num-seeds 1 \
+    --env-ids dm_control/cheetah-run-v0 dm_control/humanoid-walk-v0 dm_control/humanoid-run-v0 dm_control/walker-walk-v0 dm_control/walker-run-v0 \
+    --command "uv run python cleanrl/vmpo_continuous_action.py --track --wandb_project_name cleanrl-bench-3" \
+    --num-seeds 2 \
     --workers 2
 
-
+# DAE
+uv pip install ".[mujoco]"
 uv run python -m cleanrl_utils.benchmark \
-    --env-ids HalfCheetah-v4 Walker2d-v4 Hopper-v4 Humanoid-v4 Pusher-v4 \
-    --command "uv run python cleanrl/vmpo_continuous_action.py --track --capture_video --wandb_project_name cleanrl-bench-2-dae" \
-    --num-seeds 1 \
+    --env-ids HalfCheetah-v4 Walker2d-v4 Hopper-v4 Humanoid-v4  \
+    --command "uv run python cleanrl/vmpo_continuous_action.py --track --capture_video --wandb_project_name cleanrl-bench-3-dae" \
+    --num-seeds 2 \
     --workers 2 --advantage_estimator dae
 
 uv pip install ".[mujoco, dm_control]"
 uv run python -m cleanrl_utils.benchmark \
-    --env-ids dm_control/cartpole-balance-v0 dm_control/cheetah-run-v0 dm_control/dog-walk-v0 dm_control/dog-run-v0 dm_control/hopper-hop-v0 dm_control/humanoid-walk-v0 dm_control/humanoid-run-v0 dm_control/humanoid-run_pure_state-v0 dm_control/humanoid_CMU-run-v0 dm_control/walker-walk-v0 dm_control/walker-run-v0 \
-    --command "uv run python cleanrl/vmpo_continuous_action.py --track --wandb_project_name cleanrl-bench-2-dae" \
-    --num-seeds 1 \
+    --env-ids dm_control/cheetah-run-v0 dm_control/humanoid-walk-v0 dm_control/humanoid-run-v0 dm_control/walker-walk-v0 dm_control/walker-run-v0 \
+    --command "uv run python cleanrl/vmpo_continuous_action.py --track --wandb_project_name cleanrl-bench-3-dae" \
+    --num-seeds 2 \
     --workers 2 --advantage_estimator dae
 
+#SGD 
 uv run python -m cleanrl_utils.benchmark \
-    --env-ids HalfCheetah-v4 Walker2d-v4 Hopper-v4 Humanoid-v4 Pusher-v4 \
-    --command "uv run python cleanrl/vmpo_continuous_action.py --track --capture_video --wandb_project_name cleanrl-bench-2-gae" \
-    --num-seeds 1 \
-    --workers 2 --advantage_estimator gae
-
-uv pip install ".[mujoco, dm_control]"
-uv run python -m cleanrl_utils.benchmark \
-    --env-ids dm_control/cartpole-balance-v0 dm_control/cheetah-run-v0 dm_control/dog-walk-v0 dm_control/dog-run-v0 dm_control/hopper-hop-v0 dm_control/humanoid-walk-v0 dm_control/humanoid-run-v0 dm_control/humanoid-run_pure_state-v0 dm_control/humanoid_CMU-run-v0 dm_control/walker-walk-v0 dm_control/walker-run-v0 \
-    --command "uv run python cleanrl/vmpo_continuous_action.py --track --wandb_project_name cleanrl-bench-2-gae" \
-    --num-seeds 1 \
-    --workers 2 --advantage_estimator gae
-
-uv run python -m cleanrl_utils.benchmark \
-    --env-ids HalfCheetah-v4 Walker2d-v4 Hopper-v4 Humanoid-v4 Pusher-v4 \
-    --command "uv run python cleanrl/vmpo_continuous_action.py --track --capture_video --wandb_project_name cleanrl-bench-2-sgd" \
-    --num-seeds 1 \
+    --env-ids HalfCheetah-v4 Walker2d-v4 Hopper-v4 Humanoid-v4  \
+    --command "uv run python cleanrl/vmpo_continuous_action.py --track --capture_video --wandb_project_name cleanrl-bench-3-sgd" \
+    --num-seeds 2 \
     --workers 2 --optimizer sgd
 
 uv pip install ".[mujoco, dm_control]"
 uv run python -m cleanrl_utils.benchmark \
-    --env-ids dm_control/cartpole-balance-v0 dm_control/cheetah-run-v0 dm_control/dog-walk-v0 dm_control/dog-run-v0 dm_control/hopper-hop-v0 dm_control/humanoid-walk-v0 dm_control/humanoid-run-v0 dm_control/humanoid-run_pure_state-v0 dm_control/humanoid_CMU-run-v0 dm_control/walker-walk-v0 dm_control/walker-run-v0 \
-    --command "uv run python cleanrl/vmpo_continuous_action.py --track --wandb_project_name cleanrl-bench-2-sgd" \
-    --num-seeds 1 \
+    --env-ids dm_control/cheetah-run-v0 dm_control/humanoid-walk-v0 dm_control/humanoid-run-v0 dm_control/walker-walk-v0 dm_control/walker-run-v0 \
+    --command "uv run python cleanrl/vmpo_continuous_action.py --track --wandb_project_name cleanrl-bench-3-sgd" \
+    --num-seeds 2 \
     --workers 2 --optimizer sgd

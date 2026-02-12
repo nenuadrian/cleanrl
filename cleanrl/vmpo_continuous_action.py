@@ -44,17 +44,17 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
     """the id of the environment"""
-    total_timesteps: int = 1_000_000
+    total_timesteps: int = 2_000_000
     """total timesteps of the experiments"""
     num_envs: int = 1
     """the number of parallel game environments"""
     num_steps: int = 2048
     """the number of steps to run in each environment per rollout"""
-    updates_per_rollout: int = 2
+    updates_per_rollout: int = 3
     """number of gradient updates after each rollout"""
-    eval_interval: int = 100_000
+    eval_interval: int = 0
     """evaluate every N env steps; 0 disables evaluation"""
-    eval_episodes: int = 10
+    eval_episodes: int = 100
     """number of episodes per evaluation"""
 
     policy_layer_sizes: tuple[int, ...] = (256, 256)
@@ -64,25 +64,25 @@ class Args:
 
     gamma: float = 0.99
     """discount factor"""
-    advantage_estimator: Literal["returns", "dae", "gae"] = "returns"
+    advantage_estimator: Literal["returns", "dae", "gae"] = "gae"
     """advantage estimator: `returns` (MC baseline), `dae` (direct TD advantage), or `gae`"""
     gae_lambda: float = 0.95
     """lambda used by GAE when `advantage_estimator=gae`"""
-    topk_fraction: float = 0.6
+    topk_fraction: float = 0.3
     """fraction of highest-advantage samples used in E-step"""
-    temperature_init: float = 1.0
+    temperature_init: float = 2.0
     """initial value for VMPO temperature dual variable"""
     temperature_lr: float = 1e-4
     """learning rate for temperature dual optimizer"""
-    epsilon_eta: float = 0.1
+    epsilon_eta: float = 0.05
     """VMPO epsilon_eta dual constraint"""
-    epsilon_mu: float = 0.02
+    epsilon_mu: float = 0.01
     """VMPO epsilon_mu trust region constraint"""
     epsilon_sigma: float = 0.01
     """VMPO epsilon_sigma trust region constraint"""
     alpha_lr: float = 1e-4
     """learning rate for alpha dual optimizer"""
-    policy_lr: float = 5e-4
+    policy_lr: float = 3e-4
     """policy network learning rate"""
     value_lr: float = 1e-3
     """value network learning rate"""
@@ -92,12 +92,6 @@ class Args:
     """momentum when `optimizer=sgd`"""
     max_grad_norm: float = 0.5
     """maximum gradient clipping norm"""
-
-    popart_beta: float = 3e-4
-    """PopArt EMA beta"""
-    popart_min_sigma: float = 1e-4
-    """PopArt minimum sigma"""
-
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
@@ -133,46 +127,6 @@ def infer_obs_dim(obs_space: gym.Space) -> int:
     return int(np.prod(obs_space.shape))
 
 
-class PopArt(nn.Module):
-    def __init__(self, in_dim: int, beta: float,  min_sigma: float):
-        super().__init__()
-        self.linear = nn.Linear(in_dim, 1)
-        nn.init.xavier_uniform_(self.linear.weight)
-        nn.init.zeros_(self.linear.bias)
-
-        self.register_buffer("mu", torch.zeros(1))
-        self.register_buffer("nu", torch.ones(1))
-        self.register_buffer("sigma", torch.ones(1))
-
-        self.beta = beta
-        self.min_sigma = min_sigma
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return self.linear(h)
-
-    def denormalize(self, v_hat: torch.Tensor) -> torch.Tensor:
-        return self.sigma * v_hat + self.mu
-
-    @torch.no_grad()
-    def update_stats(self, returns: torch.Tensor) -> None:
-        batch_mu = returns.mean()
-        batch_nu = (returns**2).mean()
-
-        mu_old = self.mu.clone()
-        sigma_old = self.sigma.clone()
-
-        self.mu.mul_(1.0 - self.beta).add_(self.beta * batch_mu)
-        self.nu.mul_(1.0 - self.beta).add_(self.beta * batch_nu)
-
-        var = torch.clamp(self.nu - self.mu**2, min=self.min_sigma**2)
-        self.sigma.copy_(torch.sqrt(var))
-
-        self.linear.weight.mul_(sigma_old / self.sigma)
-        self.linear.bias.copy_(
-            (sigma_old * self.linear.bias + mu_old - self.mu) / self.sigma
-        )
-
-
 class VMPOEncoder(nn.Module):
     def __init__(
         self,
@@ -202,8 +156,6 @@ class SquashedGaussianPolicy(nn.Module):
         self,
         obs_dim: int,
         act_dim: int,
-        popart_beta: float,
-        popart_min_sigma: float,
         policy_layer_sizes: Tuple[int, ...],
         value_layer_sizes: Tuple[int, ...],
         action_low: np.ndarray | None,
@@ -221,12 +173,9 @@ class SquashedGaussianPolicy(nn.Module):
 
         self.policy_mean = nn.Linear(policy_layer_sizes[-1], act_dim)
         self.policy_logstd = nn.Linear(policy_layer_sizes[-1], act_dim)
-
-        self.value_head = PopArt(
-            value_layer_sizes[-1],
-            beta=popart_beta,
-            min_sigma=popart_min_sigma,
-        )
+        self.value_head = nn.Linear(value_layer_sizes[-1], 1)
+        nn.init.xavier_uniform_(self.value_head.weight)
+        nn.init.zeros_(self.value_head.bias)
 
         if action_low is None or action_high is None:
             action_low = -np.ones(act_dim, dtype=np.float32)
@@ -254,12 +203,10 @@ class SquashedGaussianPolicy(nn.Module):
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.get_policy_dist_params(obs)
 
-    def get_value(self, obs: torch.Tensor, normalized: bool = False) -> torch.Tensor:
+    def get_value(self, obs: torch.Tensor) -> torch.Tensor:
         h = self.value_encoder(obs)
         v_hat = self.value_head(h)
-        if normalized:
-            return v_hat
-        return self.value_head.denormalize(v_hat)
+        return v_hat
 
     def forward_all(
         self, obs: torch.Tensor
@@ -269,7 +216,7 @@ class SquashedGaussianPolicy(nn.Module):
             self.policy_encoder(obs) if self.shared_encoder else self.value_encoder(obs)
         )
         v_hat = self.value_head(h_val)
-        v = self.value_head.denormalize(v_hat)
+        v = v_hat
         return mean, log_std, v
 
     def log_prob(
@@ -329,8 +276,6 @@ class VMPOConfig:
     epsilon_sigma: float = 0.01
     alpha_lr: float = 1e-4
     max_grad_norm: float = 10.0
-    popart_beta: float = 3e-4
-    popart_min_sigma: float = 1e-4
 
 
 class VMPOAgent:
@@ -355,8 +300,6 @@ class VMPOAgent:
             value_layer_sizes=value_layer_sizes,
             action_low=action_low,
             action_high=action_high,
-            popart_beta=config.popart_beta,
-            popart_min_sigma=config.popart_min_sigma,
             shared_encoder=False,
         ).to(device)
 
@@ -474,7 +417,7 @@ class VMPOAgent:
 
         obs_t = torch.tensor(obs_np, dtype=torch.float32, device=self.device)
         with torch.no_grad():
-            v = self.policy.get_value(obs_t, normalized=False).squeeze(-1)
+            v = self.policy.get_value(obs_t).squeeze(-1)
 
         v_np = v.cpu().numpy()
         if not is_batch:
@@ -496,15 +439,13 @@ class VMPOAgent:
             ).detach()
 
         with torch.no_grad():
-            self.policy.value_head.update_stats(returns_raw)
-
-        with torch.no_grad():
             k = max(1, int(self.config.topk_fraction * advantages.numel()))
-            topk_vals, _ = torch.topk(advantages, k)
+            topk_vals, topk_idx = torch.topk(advantages, k, sorted=False)
             threshold = topk_vals.min()
-            mask_bool = advantages >= threshold
-            A_sel = advantages[mask_bool]
-            K_scalar = float(A_sel.numel())
+            mask_bool = torch.zeros_like(advantages, dtype=torch.bool)
+            mask_bool[topk_idx] = True
+            A_sel = advantages[topk_idx]
+            K_scalar = float(k)
 
         eta = F.softplus(self.log_temperature) + 1e-8
         A_max = A_sel.max().detach()
@@ -595,10 +536,8 @@ class VMPOAgent:
             weighted_nll + (alpha_mu_det * kl_mu_sel) + (alpha_sigma_det * kl_sigma_sel)
         )
 
-        v_hat = self.policy.get_value(obs, normalized=True).squeeze(-1)
-        target_hat = (
-            returns_raw - self.policy.value_head.mu
-        ) / self.policy.value_head.sigma
+        v_hat = self.policy.get_value(obs).squeeze(-1)
+        target_hat = returns_raw
         value_loss = 0.5 * F.mse_loss(v_hat, target_hat.detach())
 
         total_loss = policy_loss + value_loss
@@ -616,7 +555,7 @@ class VMPOAgent:
             ).detach()
             param_delta = torch.norm(params_after - params_before).item()
 
-            v_pred = self.policy.get_value(obs, normalized=False).squeeze(-1)
+            v_pred = self.policy.get_value(obs).squeeze(-1)
             y = returns_raw
             var_y = y.var(unbiased=False)
             explained_var = 1.0 - (y - v_pred).var(unbiased=False) / (var_y + 1e-8)
@@ -631,7 +570,7 @@ class VMPOAgent:
                 (0.5 * (1 + torch.log(2 * torch.pi * new_std_sel**2))).sum(-1).mean()
             )
 
-        return {
+        metrics = {
             "loss/total": float(total_loss.item()),
             "loss/policy": float(policy_loss.item()),
             "loss/policy_weighted_nll": float(weighted_nll.item()),
@@ -663,13 +602,8 @@ class VMPOAgent:
             "returns/raw_mean": float(returns_raw.mean().item()),
             "returns/raw_std": float((returns_raw.std(unbiased=False) + 1e-8).item()),
             "value/explained_var": float(explained_var.item()),
-            "popart/value_head_mu": float(self.policy.value_head.mu.item()),
-            "popart/value_head_sigma": float(self.policy.value_head.sigma.item()),
-            "popart/target_hat_mean": float(target_hat.mean().item()),
-            "popart/target_hat_std": float(target_hat.std(unbiased=False).item()),
-            "popart/v_hat_mean": float(v_hat.mean().item()),
-            "popart/v_hat_std": float(v_hat.std(unbiased=False).item()),
         }
+        return metrics
 
 
 def compute_returns(
@@ -878,8 +812,6 @@ if __name__ == "__main__":
         epsilon_sigma=args.epsilon_sigma,
         alpha_lr=args.alpha_lr,
         max_grad_norm=args.max_grad_norm,
-        popart_beta=args.popart_beta,
-        popart_min_sigma=args.popart_min_sigma,
     )
 
     action_low = getattr(envs.single_action_space, "low", None)
@@ -1033,7 +965,7 @@ if __name__ == "__main__":
 
                 reset_rollout()
 
-            if args.eval_interval > 0 and global_step % args.eval_interval == 0:
+            if global_step >= args.total_timesteps or (args.eval_interval > 0 and global_step % args.eval_interval == 0):
                 eval_metrics = evaluate(
                     agent=agent,
                     make_env=make_env,
