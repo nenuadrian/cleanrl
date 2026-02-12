@@ -58,6 +58,7 @@ def evaluate(
             idx=0,
             capture_video=capture_video,
             run_name=run_name,
+            gamma=gamma,
         )()
         try:
             for i in range(n_episodes):
