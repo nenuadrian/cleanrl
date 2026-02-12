@@ -981,10 +981,10 @@ if __name__ == "__main__":
 
     env = make_env(
         args.env_id,
-        seed=args.seed,
         idx=0,
         capture_video=args.capture_video,
         run_name=run_name,
+        gamma=args.gamma
     )()
     if not isinstance(env.action_space, gym.spaces.Box):
         raise ValueError("MPO only supports continuous action spaces")
@@ -1033,12 +1033,12 @@ if __name__ == "__main__":
     episode_return = 0.0
     episode_length = 0
     train_start_time: float | None = None
+    update_step = 0
 
     try:
         for global_step in range(1, args.total_timesteps + 1):
             if train_start_time is None and global_step >= args.learning_starts:
                 train_start_time = time.time()
-            train_step = max(0, global_step - args.learning_starts)
 
             if global_step < args.learning_starts:
                 action_exec = env.action_space.sample().astype(np.float32)
@@ -1069,13 +1069,8 @@ if __name__ == "__main__":
 
             if terminated or truncated:
                 print(f"global_step={global_step}, episodic_return={episode_return}")
-                if train_step > 0:
-                    writer.add_scalar(
-                        "charts/episodic_return", episode_return, train_step
-                    )
-                    writer.add_scalar(
-                        "charts/episodic_length", episode_length, train_step
-                    )
+                writer.add_scalar("charts/episodic_return", episode_return, global_step)
+                writer.add_scalar("charts/episodic_length", episode_length, global_step)
                 obs, _ = env.reset()
                 obs = flatten_obs(obs)
                 episode_return = 0.0
@@ -1093,22 +1088,24 @@ if __name__ == "__main__":
                         batch = replay.sample(args.batch_size)
 
                     metrics = agent.update(batch)
+                    update_step += 1
                     for key, value in metrics.items():
-                        writer.add_scalar(key, value, train_step)
+                        writer.add_scalar(key, value, update_step)
 
             if (
-                train_step > 0
-                and train_step % 100 == 0
+                global_step >= args.learning_starts
+                and global_step % 100 == 0
                 and train_start_time is not None
             ):
-                sps = int(train_step / max(1e-8, time.time() - train_start_time))
+                train_env_steps = global_step - args.learning_starts
+                sps = int(train_env_steps / max(1e-8, time.time() - train_start_time))
                 print("SPS:", sps)
-                writer.add_scalar("charts/SPS", sps, train_step)
+                writer.add_scalar("charts/SPS", sps, global_step)
 
             if (
                 args.eval_interval > 0
-                and train_step > 0
-                and train_step % args.eval_interval == 0
+                and global_step >= args.learning_starts
+                and global_step % args.eval_interval == 0
             ):
                 eval_metrics = evaluate(
                     agent=agent,
@@ -1119,9 +1116,9 @@ if __name__ == "__main__":
                     n_episodes=args.eval_episodes,
                 )
                 for key, value in eval_metrics.items():
-                    writer.add_scalar(key, value, train_step)
+                    writer.add_scalar(key, value, global_step)
                 print(
-                    f"eval step={train_step} (global={global_step}) "
+                    f"eval step={global_step} "
                     f"mean={eval_metrics['eval/return_mean']:.3f} "
                     f"std={eval_metrics['eval/return_std']:.3f}"
                 )

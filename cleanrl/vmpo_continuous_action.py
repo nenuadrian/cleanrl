@@ -64,7 +64,7 @@ class Args:
 
     gamma: float = 0.99
     """discount factor"""
-    topk_fraction: float = 0.5
+    topk_fraction: float = 1.0
     """fraction of highest-advantage samples used in E-step"""
     temperature_init: float = 1.0
     """initial value for VMPO temperature dual variable"""
@@ -417,7 +417,6 @@ class VMPOAgent:
                     "lr": self.config.value_lr,
                 },
             ],
-            eps=1e-5,
         )
 
         self.log_temperature = nn.Parameter(
