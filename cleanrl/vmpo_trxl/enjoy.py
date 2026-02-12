@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import gymnasium as gym
 import torch
 import tyro
-from ppo_trxl import Agent, make_env
+from vmpo_trxl import Agent, make_env
 
 
 @dataclass

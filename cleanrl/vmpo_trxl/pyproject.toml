@@ -1,5 +1,5 @@
 [project]
-name = "ppo-trxl"
+name = "vmpo-trxl"
 version = "1.0.1"
 description = ""
 authors = [{ name = "Marco Pleines", email = "marco.pleines@tu-dortmund.de" }]

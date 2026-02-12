@@ -735,7 +735,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ppo-trxl"
+name = "vmpo-trxl"
 version = "1.0.1"
 source = { editable = "." }
 dependencies = [

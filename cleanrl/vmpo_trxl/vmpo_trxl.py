@@ -14,7 +14,7 @@ import tyro
 from einops import rearrange
 from minigrid.wrappers import ImgObsWrapper, RGBImgPartialObsWrapper
 from pom_env import PoMEnv  # noqa
-from torch.distributions import Categorical
+from torch.distributions import Categorical, kl_divergence
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -53,7 +53,7 @@ class Args:
     num_steps: int = 512
     """the number of steps to run in each environment per policy rollout"""
     anneal_steps: int = 32 * 512 * 10000
-    """the number of steps to linearly anneal the learning rate and entropy coefficient from initial to final"""
+    """the number of steps to linearly anneal the learning rate from initial to final"""
     gamma: float = 0.995
     """the discount factor gamma"""
     gae_lambda: float = 0.95
@@ -64,10 +64,24 @@ class Args:
     """the K epochs to update the policy"""
     norm_adv: bool = False
     """Toggles advantages normalization"""
-    clip_coef: float = 0.1
-    """the surrogate clipping coefficient"""
-    clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
+    vmpo_topk_fraction: float = 0.5
+    """fraction of highest advantages used in the E-step weights"""
+    vmpo_eps_eta: float = 0.02
+    """temperature dual constraint from V-MPO (epsilon_eta)"""
+    vmpo_eps_alpha: float = 0.01
+    """policy KL dual constraint from V-MPO (epsilon_alpha)"""
+    vmpo_init_eta: float = 1.0
+    """initial value of the temperature dual variable eta"""
+    vmpo_init_alpha: float = 1.0
+    """initial value of the KL dual variable alpha"""
+    vmpo_min_eta: float = 1e-8
+    """minimum value of eta to keep it positive"""
+    vmpo_min_alpha: float = 1e-8
+    """minimum value of alpha to keep it positive"""
+    vmpo_dual_lr: float = 1e-4
+    """learning rate for the dual variables eta and alpha"""
+    vmpo_dual_steps: int = 1
+    """number of dedicated dual-variable gradient steps per minibatch"""
     init_ent_coef: float = 0.0001
     """initial coefficient of the entropy bonus"""
     final_ent_coef: float = 0.000001
@@ -76,8 +90,6 @@ class Args:
     """coefficient of the value function"""
     max_grad_norm: float = 0.25
     """the maximum norm for the gradient clipping"""
-    target_kl: float = None
-    """the target KL divergence threshold"""
 
     # Transformer-XL specific arguments
     trxl_num_layers: int = 3
@@ -312,7 +324,7 @@ class Agent(nn.Module):
         x = self.hidden_post_trxl(x)
         return self.critic(x).flatten()
 
-    def get_action_and_value(self, x, memory, memory_mask, memory_indices, action=None):
+    def get_action_and_value(self, x, memory, memory_mask, memory_indices, action=None, return_logits=False):
         if len(self.obs_shape) > 1:
             x = self.encoder(x.permute((0, 3, 1, 2)) / 255.0)
         else:
@@ -320,14 +332,18 @@ class Agent(nn.Module):
         x, memory = self.transformer(x, memory, memory_mask, memory_indices)
         x = self.hidden_post_trxl(x)
         self.x = x
-        probs = [Categorical(logits=branch(x)) for branch in self.actor_branches]
+        logits = [branch(x) for branch in self.actor_branches]
+        probs = [Categorical(logits=branch_logits) for branch_logits in logits]
         if action is None:
             action = torch.stack([dist.sample() for dist in probs], dim=1)
         log_probs = []
         for i, dist in enumerate(probs):
             log_probs.append(dist.log_prob(action[:, i]))
         entropies = torch.stack([dist.entropy() for dist in probs], dim=1).sum(1).reshape(-1)
-        return action, torch.stack(log_probs, dim=1), entropies, self.critic(x).flatten(), memory
+        outputs = (action, torch.stack(log_probs, dim=1), entropies, self.critic(x).flatten(), memory)
+        if return_logits:
+            return outputs + (logits,)
+        return outputs
 
     def reconstruct_observation(self):
         x = self.transposed_cnn(self.x)
@@ -336,6 +352,16 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    if not (0.0 < args.vmpo_topk_fraction <= 1.0):
+        raise ValueError("--vmpo_topk_fraction must be in (0, 1].")
+    if args.vmpo_init_eta <= 0.0 or args.vmpo_init_alpha <= 0.0:
+        raise ValueError("--vmpo_init_eta and --vmpo_init_alpha must be > 0.")
+    if args.vmpo_dual_lr <= 0.0:
+        raise ValueError("--vmpo_dual_lr must be > 0.")
+    if args.vmpo_dual_steps < 1:
+        raise ValueError("--vmpo_dual_steps must be >= 1.")
+    args.vmpo_min_eta = max(args.vmpo_min_eta, 1e-12)
+    args.vmpo_min_alpha = max(args.vmpo_min_alpha, 1e-12)
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
@@ -395,7 +421,10 @@ if __name__ == "__main__":
     args.trxl_memory_length = min(args.trxl_memory_length, max_episode_steps)
 
     agent = Agent(args, observation_space, action_space_shape, max_episode_steps).to(device)
-    optimizer = optim.AdamW(agent.parameters(), lr=args.init_lr)
+    log_eta = nn.Parameter(torch.log(torch.tensor(args.vmpo_init_eta, dtype=torch.float32)))
+    log_alpha = nn.Parameter(torch.log(torch.tensor(args.vmpo_init_alpha, dtype=torch.float32)))
+    policy_optimizer = optim.AdamW(agent.parameters(), lr=args.init_lr)
+    dual_optimizer = optim.AdamW([log_eta, log_alpha], lr=args.vmpo_dual_lr)
     bce_loss = nn.BCELoss()  # Binary cross entropy loss for observation reconstruction
 
     # ALGO Logic: Storage setup
@@ -403,8 +432,10 @@ if __name__ == "__main__":
     actions = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)), dtype=torch.long)
     dones = torch.zeros((args.num_steps, args.num_envs))
     obs = torch.zeros((args.num_steps, args.num_envs) + observation_space.shape)
-    log_probs = torch.zeros((args.num_steps, args.num_envs, len(action_space_shape)))
     values = torch.zeros((args.num_steps, args.num_envs))
+    old_policy_logits = [
+        torch.zeros((args.num_steps, args.num_envs, num_actions), dtype=torch.float32) for num_actions in action_space_shape
+    ]
     # The length of stored-memories is equal to the number of sampled episodes during training data sampling
     # (num_episodes, max_episode_length, num_layers, embed_dim)
     stored_memories = []
@@ -459,7 +490,7 @@ if __name__ == "__main__":
         do_anneal = args.anneal_steps > 0 and global_step < args.anneal_steps
         frac = 1 - global_step / args.anneal_steps if do_anneal else 0
         lr = (args.init_lr - args.final_lr) * frac + args.final_lr
-        for param_group in optimizer.param_groups:
+        for param_group in policy_optimizer.param_groups:
             param_group["lr"] = lr
         ent_coef = (args.init_ent_coef - args.final_ent_coef) * frac + args.final_ent_coef
 
@@ -479,12 +510,18 @@ if __name__ == "__main__":
                 stored_memory_indices[step] = memory_indices[env_current_episode_step]
                 # Retrieve the memory window from the entire episodic memory
                 memory_window = batched_index_select(next_memory, 1, stored_memory_indices[step])
-                action, logprob, _, value, new_memory = agent.get_action_and_value(
-                    next_obs, memory_window, stored_memory_masks[step], stored_memory_indices[step]
+                action, _, _, value, new_memory, logits = agent.get_action_and_value(
+                    next_obs,
+                    memory_window,
+                    stored_memory_masks[step],
+                    stored_memory_indices[step],
+                    return_logits=True,
                 )
                 next_memory[env_ids, env_current_episode_step] = new_memory
-                # Store the action, log_prob, and value in the buffer
-                actions[step], log_probs[step], values[step] = action, logprob, value
+                # Store actions, values, and target policy logits in the buffer
+                actions[step], values[step] = action, value
+                for branch_idx, branch_logits in enumerate(logits):
+                    old_policy_logits[branch_idx][step] = branch_logits
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
@@ -545,11 +582,11 @@ if __name__ == "__main__":
 
         # Flatten the batch
         b_obs = obs.reshape(-1, *obs.shape[2:])
-        b_logprobs = log_probs.reshape(-1, *log_probs.shape[2:])
         b_actions = actions.reshape(-1, *actions.shape[2:])
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
+        b_old_policy_logits = [branch_logits.reshape(-1, branch_logits.shape[-1]) for branch_logits in old_policy_logits]
         b_memory_index = stored_memory_index.reshape(-1)
         b_memory_indices = stored_memory_indices.reshape(-1, *stored_memory_indices.shape[2:])
         b_memory_mask = stored_memory_masks.reshape(-1, *stored_memory_masks.shape[2:])
@@ -563,7 +600,16 @@ if __name__ == "__main__":
             stored_memories = stored_memories[:, :actual_max_episode_steps]
 
         # Optimizing the policy and value network
-        clipfracs = []
+        pg_loss = torch.tensor(0.0)
+        eta_loss = torch.tensor(0.0)
+        alpha_loss = torch.tensor(0.0)
+        v_loss = torch.tensor(0.0)
+        entropy_loss = torch.tensor(0.0)
+        r_loss = torch.tensor(0.0)
+        loss = torch.tensor(0.0)
+        policy_kl = torch.tensor(0.0)
+        temperature = torch.tensor(0.0)
+        alpha_value = torch.tensor(0.0)
         for epoch in range(args.update_epochs):
             b_inds = torch.randperm(args.batch_size)
             for start in range(0, args.batch_size, args.minibatch_size):
@@ -572,58 +618,84 @@ if __name__ == "__main__":
                 mb_memories = stored_memories[b_memory_index[mb_inds]]
                 mb_memory_windows = batched_index_select(mb_memories, 1, b_memory_indices[mb_inds])
 
-                _, newlogprob, entropy, newvalue, _ = agent.get_action_and_value(
-                    b_obs[mb_inds], mb_memory_windows, b_memory_mask[mb_inds], b_memory_indices[mb_inds], b_actions[mb_inds]
+                _, newlogprob, entropy, newvalue, _, new_logits = agent.get_action_and_value(
+                    b_obs[mb_inds],
+                    mb_memory_windows,
+                    b_memory_mask[mb_inds],
+                    b_memory_indices[mb_inds],
+                    b_actions[mb_inds],
+                    return_logits=True,
                 )
 
-                # Policy loss
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-                mb_advantages = mb_advantages.unsqueeze(1).repeat(
-                    1, len(action_space_shape)
-                )  # Repeat is necessary for multi-discrete action spaces
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = torch.exp(logratio)
-                pgloss1 = -mb_advantages * ratio
-                pgloss2 = -mb_advantages * torch.clamp(ratio, 1.0 - args.clip_coef, 1.0 + args.clip_coef)
-                pg_loss = torch.max(pgloss1, pgloss2).mean()
 
-                # Value loss
-                v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                if args.clip_vloss:
-                    v_loss_clipped = b_values[mb_inds] + (newvalue - b_values[mb_inds]).clamp(
-                        min=-args.clip_coef, max=args.clip_coef
-                    )
-                    v_loss = torch.max(v_loss_unclipped, (v_loss_clipped - b_returns[mb_inds]) ** 2).mean()
-                else:
-                    v_loss = v_loss_unclipped.mean()
+                # V-MPO E-step: keep only top-k advantages and build normalized weights.
+                topk_count = max(1, int(args.vmpo_topk_fraction * mb_advantages.shape[0]))
+                topk_count = min(topk_count, mb_advantages.shape[0])
+                topk_indices = torch.topk(mb_advantages, k=topk_count, sorted=False).indices
+                top_advantages = mb_advantages[topk_indices].detach()
 
-                # Entropy loss
+                # Joint log-prob for factorized multi-discrete action spaces.
+                joint_log_prob = newlogprob.sum(dim=1)
+
+                eta = torch.exp(log_eta).clamp_min(args.vmpo_min_eta)
+                alpha = torch.exp(log_alpha).clamp_min(args.vmpo_min_alpha)
+
+                weights = torch.softmax(top_advantages / eta.detach(), dim=0).detach()
+                pg_loss = -(weights * joint_log_prob[topk_indices]).sum()
+
+                eta_loss = eta * args.vmpo_eps_eta + eta * (
+                    torch.logsumexp(top_advantages / eta, dim=0) - np.log(topk_count)
+                )
+
+                old_dists = [Categorical(logits=branch_logits[mb_inds]) for branch_logits in b_old_policy_logits]
+                new_dists = [Categorical(logits=branch_logits) for branch_logits in new_logits]
+                policy_kl = torch.stack(
+                    [kl_divergence(old_dist, new_dist) for old_dist, new_dist in zip(old_dists, new_dists)],
+                    dim=1,
+                ).sum(dim=1)
+                policy_kl = policy_kl.mean()
+
+                alpha_constraint_loss = alpha * (args.vmpo_eps_alpha - policy_kl.detach())
+                alpha_loss = alpha_constraint_loss + alpha.detach() * policy_kl
+
+                v_loss = ((newvalue - b_returns[mb_inds]) ** 2).mean()
                 entropy_loss = entropy.mean()
 
-                # Combined losses
-                loss = pg_loss - ent_coef * entropy_loss + v_loss * args.vf_coef
+                # Combined policy/value loss with dual variables treated as constants.
+                policy_loss = pg_loss + alpha.detach() * policy_kl - ent_coef * entropy_loss + args.vf_coef * v_loss
 
                 # Add reconstruction loss if used
-                r_loss = torch.tensor(0.0)
+                r_loss = torch.tensor(0.0, device=device)
                 if args.reconstruction_coef > 0.0:
                     r_loss = bce_loss(agent.reconstruct_observation(), b_obs[mb_inds] / 255.0)
-                    loss += args.reconstruction_coef * r_loss
+                    policy_loss += args.reconstruction_coef * r_loss
+                loss = policy_loss + eta_loss + alpha_constraint_loss
 
-                optimizer.zero_grad()
-                loss.backward()
+                policy_optimizer.zero_grad()
+                policy_loss.backward()
                 torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=args.max_grad_norm)
-                optimizer.step()
+                policy_optimizer.step()
+
+                # Coordinate-style update for dual variables (eta, alpha).
+                for _ in range(args.vmpo_dual_steps):
+                    dual_optimizer.zero_grad()
+                    eta_dual = torch.exp(log_eta).clamp_min(args.vmpo_min_eta)
+                    alpha_dual = torch.exp(log_alpha).clamp_min(args.vmpo_min_alpha)
+                    dual_loss = eta_dual * args.vmpo_eps_eta + eta_dual * (
+                        torch.logsumexp(top_advantages / eta_dual, dim=0) - np.log(topk_count)
+                    ) + alpha_dual * (args.vmpo_eps_alpha - policy_kl.detach())
+                    dual_loss.backward()
+                    dual_optimizer.step()
+                    with torch.no_grad():
+                        log_eta.data.clamp_(min=np.log(args.vmpo_min_eta))
+                        log_alpha.data.clamp_(min=np.log(args.vmpo_min_alpha))
 
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
-
-            if args.target_kl is not None and approx_kl > args.target_kl:
-                break
+                    temperature = torch.exp(log_eta)
+                    alpha_value = torch.exp(log_alpha)
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
@@ -637,14 +709,18 @@ if __name__ == "__main__":
                 episode_result[key + "_mean"] = np.mean([info[key] for info in episode_infos])
 
         print(
-            "{:9} SPS={:4} return={:.2f} length={:.1f} pi_loss={:.3f} v_loss={:.3f} entropy={:.3f} r_loss={:.3f} value={:.3f} adv={:.3f}".format(
+            "{:9} SPS={:4} return={:.2f} length={:.1f} pi_loss={:.3f} eta_loss={:.3f} alpha_loss={:.3f} v_loss={:.3f} kl={:.4f} eta={:.4f} alpha={:.4f} r_loss={:.3f} value={:.3f} adv={:.3f}".format(
                 iteration,
                 int(global_step / (time.time() - start_time)),
                 episode_result["r_mean"],
                 episode_result["l_mean"],
                 pg_loss.item(),
+                eta_loss.item(),
+                alpha_loss.item(),
                 v_loss.item(),
-                entropy_loss.item(),
+                policy_kl.item(),
+                temperature.item(),
+                alpha_value.item(),
                 r_loss.item(),
                 torch.mean(values),
                 torch.mean(advantages),
@@ -659,13 +735,15 @@ if __name__ == "__main__":
         writer.add_scalar("charts/learning_rate", lr, global_step)
         writer.add_scalar("charts/entropy_coefficient", ent_coef, global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+        writer.add_scalar("losses/eta_loss", eta_loss.item(), global_step)
+        writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/loss", loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/reconstruction_loss", r_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+        writer.add_scalar("losses/policy_kl", policy_kl.item(), global_step)
+        writer.add_scalar("losses/eta", temperature.item(), global_step)
+        writer.add_scalar("losses/alpha", alpha_value.item(), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
