@@ -1,0 +1,5 @@
+|                           | adrian-research/cleanrl-local/vmpo_continuous_action ({})   |
+|:--------------------------|:------------------------------------------------------------|
+| Humanoid-v4               | 369.95 ± 124.12                                             |
+| HalfCheetah-v4            | 57.94 ± 145.47                                              |
+| dm_control/cheetah-run-v0 | 196.00 ± 0.00                                               |

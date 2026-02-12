@@ -9,7 +9,6 @@ import torch
 def evaluate(
     agent: Any,
     make_env: Callable,
-    flatten_obs: Callable[[Any], np.ndarray],
     env_id: str,
     seed: int,
     n_episodes: int = 10,
@@ -29,25 +28,23 @@ def evaluate(
         )
         try:
             obs, _ = eval_envs.reset(seed=seed)
-            episode_returns = np.zeros(n_episodes, dtype=np.float32)
-            dones = np.zeros(n_episodes, dtype=bool)
 
             while len(returns) < n_episodes:
-                obs = flatten_obs(obs)
-                action, _, _, _ = agent.act(obs, deterministic=True)
+                action, _, _, _ = agent.act(obs, deterministic=False)
                 action = np.clip(
                     action,
                     eval_envs.single_action_space.low,
                     eval_envs.single_action_space.high,
                 )
-                next_obs, reward, terminated, truncated, _ = eval_envs.step(action)
-                episode_returns += reward
-
-                done = np.asarray(terminated) | np.asarray(truncated)
-                for i in range(n_episodes):
-                    if not dones[i] and done[i]:
-                        returns.append(float(episode_returns[i]))
-                        dones[i] = True
+                next_obs, _, _, _, infos = eval_envs.step(action)
+                if "final_info" in infos:
+                    for info in infos["final_info"]:
+                        if info and "episode" in info:
+                            returns.append(
+                                float(np.asarray(info["episode"]["r"]).reshape(-1)[0])
+                            )
+                            if len(returns) >= n_episodes:
+                                break
                 obs = next_obs
         finally:
             eval_envs.close()
@@ -67,16 +64,19 @@ def evaluate(
         try:
             for i in range(n_episodes):
                 obs, _ = eval_env.reset(seed=seed + i)
-                obs = flatten_obs(obs)
                 done = False
-                ep_return = 0.0
                 while not done:
-                    action = agent.act(obs, deterministic=True)
-                    obs, reward, terminated, truncated, _ = eval_env.step(action)
-                    obs = flatten_obs(obs)
-                    ep_return += float(reward)
+                    action = agent.act(obs, deterministic=False)
+                    obs, _, terminated, truncated, info = eval_env.step(action)
                     done = bool(terminated or truncated)
-                returns.append(ep_return)
+                if "episode" in info:
+                    returns.append(
+                        float(np.asarray(info["episode"]["r"]).reshape(-1)[0])
+                    )
+                else:
+                    raise RuntimeError(
+                        "Missing episode statistics in evaluation info; ensure RecordEpisodeStatistics is enabled."
+                    )
         finally:
             eval_env.close()
 

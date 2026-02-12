@@ -53,20 +53,20 @@ class Args:
     """the number of parallel environments (this script currently supports 1)"""
     buffer_size: int = 1_000_000
     """the replay memory buffer size"""
-    learning_starts: int = 5_000
+    learning_starts: int = 100_000
     """timestep to start learning"""
     batch_size: int = 256
     """the batch size sampled from replay"""
-    updates_per_step: int = 1
+    updates_per_step: int = 2
     """number of gradient updates per environment step"""
-    eval_interval: int = 10_000
+    eval_interval: int = 100_000
     """evaluate every N steps; 0 disables eval"""
     eval_episodes: int = 10
     """number of episodes used for each evaluation"""
 
-    policy_layer_sizes: tuple[int, ...] = (256, 256, 256)
+    policy_layer_sizes: tuple[int, ...] = (256, 256)
     """hidden layer sizes for policy network"""
-    critic_layer_sizes: tuple[int, ...] = (256, 256, 256)
+    critic_layer_sizes: tuple[int, ...] = (256, 256)
     """hidden layer sizes for critic network"""
 
     gamma: float = 0.99
@@ -140,43 +140,6 @@ def infer_obs_dim(obs_space: gym.Space) -> int:
     if obs_space.shape is None:
         raise ValueError("Observation space has no shape.")
     return int(np.prod(obs_space.shape))
-
-
-def flatten_obs(obs):
-    if isinstance(obs, dict):
-        if not obs:
-            return np.asarray([], dtype=np.float32)
-
-        parts = []
-        for key in sorted(obs.keys()):
-            p = np.asarray(obs[key], dtype=np.float32)
-            if p.ndim == 0:
-                p = p.reshape(1)
-            parts.append(p)
-
-        leading_dims = [p.shape[0] for p in parts if p.ndim >= 2]
-        is_vectorized = len(leading_dims) > 0
-
-        if is_vectorized:
-            n = leading_dims[0]
-            flat_parts = [
-                p.reshape(n, 1) if p.ndim == 1 else p.reshape(n, -1) for p in parts
-            ]
-            return np.concatenate(flat_parts, axis=1)
-
-        flat_parts = []
-        for p in parts:
-            if p.ndim != 1:
-                raise ValueError(f"Unexpected shape in single-env obs: {p.shape}")
-            flat_parts.append(p.reshape(-1))
-        return np.concatenate(flat_parts, axis=0)
-
-    arr = np.asarray(obs, dtype=np.float32)
-    if arr.ndim == 0:
-        return arr.reshape(1)
-    if arr.ndim == 1:
-        return arr
-    return arr.reshape(arr.shape[0], -1)
 
 
 class LayerNormMLP(nn.Module):
@@ -1029,7 +992,6 @@ if __name__ == "__main__":
     )
 
     obs, _ = env.reset(seed=args.seed)
-    obs = flatten_obs(obs)
     episode_return = 0.0
     episode_length = 0
     train_start_time: float | None = None
@@ -1050,7 +1012,6 @@ if __name__ == "__main__":
                 )
 
             next_obs, reward, terminated, truncated, _ = env.step(action_exec)
-            next_obs = flatten_obs(next_obs)
             reward_f = float(reward)
             done = float(terminated or truncated)
 
@@ -1072,7 +1033,6 @@ if __name__ == "__main__":
                 writer.add_scalar("charts/episodic_return", episode_return, global_step)
                 writer.add_scalar("charts/episodic_length", episode_length, global_step)
                 obs, _ = env.reset()
-                obs = flatten_obs(obs)
                 episode_return = 0.0
                 episode_length = 0
 
@@ -1110,7 +1070,6 @@ if __name__ == "__main__":
                 eval_metrics = evaluate(
                     agent=agent,
                     make_env=make_env,
-                    flatten_obs=flatten_obs,
                     env_id=args.env_id,
                     seed=args.seed + 1000,
                     gamma=args.gamma,
@@ -1132,7 +1091,6 @@ if __name__ == "__main__":
             _, episodic_returns = evaluate(
                 agent=agent,
                 make_env=make_env,
-                flatten_obs=flatten_obs,
                 env_id=args.env_id,
                 seed=args.seed + 1000,
                 gamma=args.gamma,

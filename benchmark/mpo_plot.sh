@@ -1,0 +1,3 @@
+python -m openrlbenchmark.rlops  --filters '?we=adrian-research&wpn=cleanrl-local&ceik=env_id&cen=exp_name&metric=charts/episodic_return'  'mpo_continuous_action'  \
+--env-ids HalfCheetah-v4 Walker2d-v4 Hopper-v4 Humanoid-v4 Pusher-v4 dm_control/cartpole-balance-v0 dm_control/cheetah-run-v0 dm_control/dog-walk-v0 dm_control/dog-run-v0 dm_control/hopper-hop-v0 dm_control/humanoid-walk-v0 dm_control/humanoid-run-v0 dm_control/humanoid-run_pure_state-v0 dm_control/humanoid_CMU-run-v0 dm_control/walker-walk-v0 dm_control/walker-run-v0  --no-check-empty-runs  --pc.ncols 3  --pc.ncols-legend 2  --output-filename benchmark/cleanrl/mpo_continuous_action  --scan-history
+

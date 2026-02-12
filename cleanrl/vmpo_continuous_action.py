@@ -2,7 +2,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Literal, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -50,9 +50,9 @@ class Args:
     """the number of parallel game environments"""
     num_steps: int = 2048
     """the number of steps to run in each environment per rollout"""
-    updates_per_rollout: int = 1
+    updates_per_rollout: int = 2
     """number of gradient updates after each rollout"""
-    eval_interval: int = 0
+    eval_interval: int = 100_000
     """evaluate every N env steps; 0 disables evaluation"""
     eval_episodes: int = 10
     """number of episodes per evaluation"""
@@ -64,7 +64,11 @@ class Args:
 
     gamma: float = 0.99
     """discount factor"""
-    topk_fraction: float = 1.0
+    advantage_estimator: Literal["returns", "dae", "gae"] = "returns"
+    """advantage estimator: `returns` (MC baseline), `dae` (direct TD advantage), or `gae`"""
+    gae_lambda: float = 0.95
+    """lambda used by GAE when `advantage_estimator=gae`"""
+    topk_fraction: float = 0.6
     """fraction of highest-advantage samples used in E-step"""
     temperature_init: float = 1.0
     """initial value for VMPO temperature dual variable"""
@@ -72,7 +76,7 @@ class Args:
     """learning rate for temperature dual optimizer"""
     epsilon_eta: float = 0.1
     """VMPO epsilon_eta dual constraint"""
-    epsilon_mu: float = 0.01
+    epsilon_mu: float = 0.02
     """VMPO epsilon_mu trust region constraint"""
     epsilon_sigma: float = 0.01
     """VMPO epsilon_sigma trust region constraint"""
@@ -82,13 +86,15 @@ class Args:
     """policy network learning rate"""
     value_lr: float = 1e-3
     """value network learning rate"""
-    max_grad_norm: float = 1.0
+    optimizer: Literal["adam", "sgd"] = "adam"
+    """optimizer used for policy/value and dual updates"""
+    sgd_momentum: float = 0.9
+    """momentum when `optimizer=sgd`"""
+    max_grad_norm: float = 0.5
     """maximum gradient clipping norm"""
 
     popart_beta: float = 3e-4
     """PopArt EMA beta"""
-    popart_eps: float = 1e-4
-    """PopArt epsilon"""
     popart_min_sigma: float = 1e-4
     """PopArt minimum sigma"""
 
@@ -127,45 +133,8 @@ def infer_obs_dim(obs_space: gym.Space) -> int:
     return int(np.prod(obs_space.shape))
 
 
-def flatten_obs(obs):
-    if isinstance(obs, dict):
-        if not obs:
-            return np.asarray([], dtype=np.float32)
-
-        parts = []
-        for key in sorted(obs.keys()):
-            p = np.asarray(obs[key], dtype=np.float32)
-            if p.ndim == 0:
-                p = p.reshape(1)
-            parts.append(p)
-
-        leading_dims = [p.shape[0] for p in parts if p.ndim >= 2]
-        is_vectorized = len(leading_dims) > 0
-
-        if is_vectorized:
-            n = leading_dims[0]
-            flat_parts = [
-                p.reshape(n, 1) if p.ndim == 1 else p.reshape(n, -1) for p in parts
-            ]
-            return np.concatenate(flat_parts, axis=1)
-
-        flat_parts = []
-        for p in parts:
-            if p.ndim != 1:
-                raise ValueError(f"Unexpected shape in single-env obs: {p.shape}")
-            flat_parts.append(p.reshape(-1))
-        return np.concatenate(flat_parts, axis=0)
-
-    arr = np.asarray(obs, dtype=np.float32)
-    if arr.ndim == 0:
-        return arr.reshape(1)
-    if arr.ndim == 1:
-        return arr
-    return arr.reshape(arr.shape[0], -1)
-
-
 class PopArt(nn.Module):
-    def __init__(self, in_dim: int, beta: float, eps: float, min_sigma: float):
+    def __init__(self, in_dim: int, beta: float,  min_sigma: float):
         super().__init__()
         self.linear = nn.Linear(in_dim, 1)
         nn.init.xavier_uniform_(self.linear.weight)
@@ -176,7 +145,6 @@ class PopArt(nn.Module):
         self.register_buffer("sigma", torch.ones(1))
 
         self.beta = beta
-        self.eps = eps
         self.min_sigma = min_sigma
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
@@ -235,7 +203,6 @@ class SquashedGaussianPolicy(nn.Module):
         obs_dim: int,
         act_dim: int,
         popart_beta: float,
-        popart_eps: float,
         popart_min_sigma: float,
         policy_layer_sizes: Tuple[int, ...],
         value_layer_sizes: Tuple[int, ...],
@@ -258,7 +225,6 @@ class SquashedGaussianPolicy(nn.Module):
         self.value_head = PopArt(
             value_layer_sizes[-1],
             beta=popart_beta,
-            eps=popart_eps,
             min_sigma=popart_min_sigma,
         )
 
@@ -353,6 +319,8 @@ class VMPOConfig:
     gamma: float = 0.99
     policy_lr: float = 5e-4
     value_lr: float = 1e-3
+    optimizer: Literal["adam", "sgd"] = "adam"
+    sgd_momentum: float = 0.9
     topk_fraction: float = 0.5
     temperature_init: float = 1.0
     temperature_lr: float = 1e-4
@@ -362,7 +330,6 @@ class VMPOConfig:
     alpha_lr: float = 1e-4
     max_grad_norm: float = 10.0
     popart_beta: float = 3e-4
-    popart_eps: float = 1e-4
     popart_min_sigma: float = 1e-4
 
 
@@ -389,12 +356,11 @@ class VMPOAgent:
             action_low=action_low,
             action_high=action_high,
             popart_beta=config.popart_beta,
-            popart_eps=config.popart_eps,
             popart_min_sigma=config.popart_min_sigma,
             shared_encoder=False,
         ).to(device)
 
-        self.opt = torch.optim.Adam(
+        self.opt = self._build_optimizer(
             [
                 {
                     "params": self.policy.policy_encoder.parameters(),
@@ -422,17 +388,34 @@ class VMPOAgent:
         self.log_temperature = nn.Parameter(
             torch.log(torch.tensor(self.config.temperature_init, device=device))
         )
-        self.eta_opt = torch.optim.Adam(
-            [self.log_temperature], lr=self.config.temperature_lr, eps=1e-5
+        self.eta_opt = self._build_optimizer(
+            [self.log_temperature],
+            lr=self.config.temperature_lr,
+            eps=1e-5,
         )
 
         self.log_alpha_mu = nn.Parameter(torch.tensor(np.log(1.0), device=device))
         self.log_alpha_sigma = nn.Parameter(torch.tensor(np.log(1.0), device=device))
-        self.alpha_opt = torch.optim.Adam(
+        self.alpha_opt = self._build_optimizer(
             [self.log_alpha_mu, self.log_alpha_sigma],
             lr=self.config.alpha_lr,
             eps=1e-5,
         )
+
+    def _build_optimizer(
+        self, params: Any, lr: float | None = None, eps: float = 1e-8
+    ) -> torch.optim.Optimizer:
+        if self.config.optimizer == "adam":
+            kwargs: Dict[str, Any] = {"eps": eps}
+            if lr is not None:
+                kwargs["lr"] = lr
+            return torch.optim.Adam(params, **kwargs)
+        if self.config.optimizer == "sgd":
+            kwargs = {"momentum": self.config.sgd_momentum}
+            if lr is not None:
+                kwargs["lr"] = lr
+            return torch.optim.SGD(params, **kwargs)
+        raise ValueError(f"Unknown optimizer: {self.config.optimizer}")
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -722,6 +705,117 @@ def compute_returns(
     return returns
 
 
+def compute_dae_targets(
+    rewards: np.ndarray,
+    dones: np.ndarray,
+    values: np.ndarray,
+    last_value: np.ndarray,
+    gamma: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    rewards_np = np.asarray(rewards, dtype=np.float32)
+    dones_np = np.asarray(dones, dtype=np.float32)
+    values_np = np.asarray(values, dtype=np.float32)
+
+    if rewards_np.ndim == 1:
+        rewards_np = rewards_np.reshape(-1, 1)
+    if dones_np.ndim == 1:
+        dones_np = dones_np.reshape(-1, 1)
+    if values_np.ndim == 1:
+        values_np = values_np.reshape(-1, 1)
+
+    T, N = rewards_np.shape
+    last_val_arr = np.asarray(last_value, dtype=np.float32)
+    if last_val_arr.ndim == 0:
+        last_val_arr = np.full((N,), float(last_val_arr), dtype=np.float32)
+    else:
+        last_val_arr = last_val_arr.reshape(N)
+
+    next_values = np.zeros((T, N), dtype=np.float32)
+    if T > 1:
+        next_values[:-1] = values_np[1:]
+    next_values[-1] = last_val_arr
+
+    returns = rewards_np + gamma * (1.0 - dones_np) * next_values
+    advantages = returns - values_np
+
+    if returns.shape[1] == 1:
+        return returns.reshape(-1), advantages.reshape(-1)
+    return returns, advantages
+
+
+def compute_gae_targets(
+    rewards: np.ndarray,
+    dones: np.ndarray,
+    values: np.ndarray,
+    last_value: np.ndarray,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    rewards_np = np.asarray(rewards, dtype=np.float32)
+    dones_np = np.asarray(dones, dtype=np.float32)
+    values_np = np.asarray(values, dtype=np.float32)
+
+    if rewards_np.ndim == 1:
+        rewards_np = rewards_np.reshape(-1, 1)
+    if dones_np.ndim == 1:
+        dones_np = dones_np.reshape(-1, 1)
+    if values_np.ndim == 1:
+        values_np = values_np.reshape(-1, 1)
+
+    T, N = rewards_np.shape
+    last_val_arr = np.asarray(last_value, dtype=np.float32)
+    if last_val_arr.ndim == 0:
+        last_val_arr = np.full((N,), float(last_val_arr), dtype=np.float32)
+    else:
+        last_val_arr = last_val_arr.reshape(N)
+
+    next_values = np.zeros((T, N), dtype=np.float32)
+    if T > 1:
+        next_values[:-1] = values_np[1:]
+    next_values[-1] = last_val_arr
+
+    deltas = rewards_np + gamma * (1.0 - dones_np) * next_values - values_np
+    advantages = np.zeros_like(rewards_np, dtype=np.float32)
+    lastgaelam = np.zeros((N,), dtype=np.float32)
+    for t in reversed(range(T)):
+        lastgaelam = deltas[t] + gamma * gae_lambda * (1.0 - dones_np[t]) * lastgaelam
+        advantages[t] = lastgaelam
+    returns = advantages + values_np
+
+    if returns.shape[1] == 1:
+        return returns.reshape(-1), advantages.reshape(-1)
+    return returns, advantages
+
+
+def compute_rollout_targets(
+    rewards: np.ndarray,
+    dones: np.ndarray,
+    values: np.ndarray,
+    last_value: np.ndarray,
+    gamma: float,
+    estimator: Literal["returns", "dae", "gae"],
+    gae_lambda: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if estimator == "returns":
+        returns = np.asarray(
+            compute_returns(rewards, dones, last_value, gamma), dtype=np.float32
+        )
+        values_np = np.asarray(values, dtype=np.float32)
+        if values_np.ndim == 1:
+            values_np = values_np.reshape(-1, 1)
+        if returns.ndim == 1:
+            returns = returns.reshape(-1, 1)
+        advantages = returns - values_np
+        return returns, advantages
+    if estimator == "dae":
+        return compute_dae_targets(rewards, dones, values, last_value, gamma)
+    if estimator == "gae":
+        return compute_gae_targets(
+            rewards, dones, values, last_value, gamma, gae_lambda
+        )
+    raise ValueError(f"Unknown advantage estimator: {estimator}")
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -774,6 +868,8 @@ if __name__ == "__main__":
         gamma=args.gamma,
         policy_lr=args.policy_lr,
         value_lr=args.value_lr,
+        optimizer=args.optimizer,
+        sgd_momentum=args.sgd_momentum,
         topk_fraction=args.topk_fraction,
         temperature_init=args.temperature_init,
         temperature_lr=args.temperature_lr,
@@ -783,7 +879,6 @@ if __name__ == "__main__":
         alpha_lr=args.alpha_lr,
         max_grad_norm=args.max_grad_norm,
         popart_beta=args.popart_beta,
-        popart_eps=args.popart_eps,
         popart_min_sigma=args.popart_min_sigma,
     )
 
@@ -832,11 +927,7 @@ if __name__ == "__main__":
         means_buf.clear()
         log_stds_buf.clear()
 
-    episode_return = np.zeros(args.num_envs, dtype=np.float32)
-    episode_length = np.zeros(args.num_envs, dtype=np.int32)
-
     obs, _ = envs.reset(seed=args.seed)
-    obs = flatten_obs(obs)
     start_time = time.time()
     global_step = 0
 
@@ -844,8 +935,7 @@ if __name__ == "__main__":
         while global_step < args.total_timesteps:
             action, value, mean, log_std = agent.act(obs, deterministic=False)
 
-            next_obs, reward, terminated, truncated, _ = envs.step(action)
-            next_obs = flatten_obs(next_obs)
+            next_obs, reward, terminated, truncated, infos = envs.step(action)
             done = np.asarray(terminated) | np.asarray(truncated)
             reward = np.asarray(reward, dtype=np.float32)
 
@@ -860,22 +950,18 @@ if __name__ == "__main__":
             obs = next_obs
             global_step += args.num_envs
 
-            episode_return += reward
-            episode_length += 1
-            finished_mask = done.astype(bool)
-            if np.any(finished_mask):
-                finished_returns = episode_return[finished_mask]
-                finished_lengths = episode_length[finished_mask]
-                for ep_return, ep_len in zip(finished_returns, finished_lengths):
-                    print(f"global_step={global_step}, episodic_return={ep_return}")
-                    writer.add_scalar(
-                        "charts/episodic_return", float(ep_return), global_step
-                    )
-                    writer.add_scalar(
-                        "charts/episodic_length", float(ep_len), global_step
-                    )
-                episode_return[finished_mask] = 0.0
-                episode_length[finished_mask] = 0
+            if "final_info" in infos:
+                for info in infos["final_info"]:
+                    if info and "episode" in info:
+                        ep_return = float(np.asarray(info["episode"]["r"]).reshape(-1)[0])
+                        ep_len = float(np.asarray(info["episode"]["l"]).reshape(-1)[0])
+                        print(f"global_step={global_step}, episodic_return={ep_return}")
+                        writer.add_scalar(
+                            "charts/episodic_return", ep_return, global_step
+                        )
+                        writer.add_scalar(
+                            "charts/episodic_length", ep_len, global_step
+                        )
 
             if len(obs_buf) >= args.num_steps:
                 obs_arr = np.stack(obs_buf)
@@ -897,14 +983,17 @@ if __name__ == "__main__":
                 means_flat = means_arr.reshape(T * N, -1)
                 log_stds_flat = log_stds_arr.reshape(T * N, -1)
 
-                returns = compute_returns(
-                    rewards_flat, dones_flat, last_value, args.gamma
+                returns, advantages = compute_rollout_targets(
+                    rewards=rewards_flat,
+                    dones=dones_flat,
+                    values=values_flat,
+                    last_value=last_value,
+                    gamma=args.gamma,
+                    estimator=args.advantage_estimator,
+                    gae_lambda=args.gae_lambda,
                 )
                 returns_flat = returns.reshape(T * N, 1)
-                values_flat2 = values_flat.reshape(T * N, 1)
-
-                advantages = returns_flat - values_flat2
-                advantages[dones_flat.reshape(-1) == 1.0] = 0.0
+                advantages_flat = advantages.reshape(T * N, 1)
 
                 batch = {
                     "obs": torch.tensor(obs_flat, dtype=torch.float32, device=device),
@@ -915,7 +1004,7 @@ if __name__ == "__main__":
                         returns_flat, dtype=torch.float32, device=device
                     ),
                     "advantages": torch.tensor(
-                        advantages, dtype=torch.float32, device=device
+                        advantages_flat, dtype=torch.float32, device=device
                     ),
                     "old_means": torch.tensor(
                         means_flat, dtype=torch.float32, device=device
@@ -948,7 +1037,6 @@ if __name__ == "__main__":
                 eval_metrics = evaluate(
                     agent=agent,
                     make_env=make_env,
-                    flatten_obs=flatten_obs,
                     env_id=args.env_id,
                     seed=args.seed + 1000,
                     gamma=args.gamma,
@@ -970,7 +1058,6 @@ if __name__ == "__main__":
             _, episodic_returns = evaluate(
                 agent=agent,
                 make_env=make_env,
-                flatten_obs=flatten_obs,
                 env_id=args.env_id,
                 seed=args.seed + 1000,
                 gamma=args.gamma,
