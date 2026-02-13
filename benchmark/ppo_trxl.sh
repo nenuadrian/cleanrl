@@ -1,7 +1,7 @@
 # export WANDB_ENTITY=openrlbenchmark
 
-cd cleanrl/ppo_trxl
-poetry install
+# cd cleanrl/ppo_trxl
+# poetry install
 OMP_NUM_THREADS=4 uv run python -m cleanrl_utils.benchmark \
     --env-ids MortarMayhem-Grid-v0 \
     --command "python ./cleanrl/ppo_trxl/ppo_trxl.py --track --wandb_project_name cleanrl-bench-4  --norm_adv --trxl_memory_length 119 --total_timesteps 100000000" \
