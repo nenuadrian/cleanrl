@@ -12,5 +12,4 @@ OMP_NUM_THREADS=4 uv run python -m cleanrl_utils.benchmark \
     --env-ids MysteryPath-Grid-v0 \
     --command "python ./cleanrl/vmpo_trxl/vmpo_trxl.py --track --trxl_memory_length 96 --total_timesteps 300000000 --wandb_project_name cleanrl-bench-4" \
     --num-seeds 1 \
-    --workers 5 \
-    --slurm-template-path benchmark/cleanrl_1gpu.slurm_template
+    --workers 5 
