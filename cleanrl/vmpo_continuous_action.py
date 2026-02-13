@@ -383,7 +383,6 @@ class VMPOAgent:
     def act(
         self,
         obs: np.ndarray,
-        deterministic: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         obs_np = np.asarray(obs)
         is_batch = obs_np.ndim > 1
@@ -865,7 +864,7 @@ if __name__ == "__main__":
 
     try:
         while global_step < args.total_timesteps:
-            action, value, mean, log_std = agent.act(obs, deterministic=False)
+            action, value, mean, log_std = agent.act(obs)
 
             next_obs, reward, terminated, truncated, infos = envs.step(action)
             done = np.asarray(terminated) | np.asarray(truncated)

@@ -47,19 +47,19 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
     """the environment id of the task"""
-    total_timesteps: int = 1_000_000
+    total_timesteps: int = 100_000
     """total timesteps of the experiments"""
     num_envs: int = 1
-    """the number of parallel environments"""
+    """the number of parallel environments (this script currently supports 1)"""
     buffer_size: int = 1_000_000
     """the replay memory buffer size"""
-    learning_starts: int = 100_000
+    learning_starts: int = 1_000
     """timestep to start learning"""
     batch_size: int = 256
     """the batch size sampled from replay"""
     updates_per_step: int = 2
     """number of gradient updates per environment step"""
-    eval_interval: int = 100_000
+    eval_interval: int = 0
     """evaluate every N steps; 0 disables eval"""
     eval_episodes: int = 10
     """number of episodes used for each evaluation"""
@@ -71,27 +71,31 @@ class Args:
 
     gamma: float = 0.99
     """discount factor"""
-    tau: float = 0.005
-    """soft target update factor"""
-    policy_lr: float = 3e-4
+    target_policy_update_period: int = 25
+    """number of learner updates between hard policy target network copies"""
+    target_critic_update_period: int = 100
+    """number of learner updates between hard critic target network copies"""
+    policy_lr: float = 1e-4
     """policy optimizer learning rate"""
-    q_lr: float = 3e-4
+    q_lr: float = 1e-4
     """critic optimizer learning rate"""
 
     kl_epsilon: float = 0.1
     """E-step KL constraint"""
     mstep_kl_epsilon: float = 0.1
     """M-step KL constraint"""
-    per_dim_constraining: bool = False
+    per_dim_constraining: bool = True
     """whether to apply per-dimension KL constraints in M-step"""
 
     temperature_init: float = 1.0
     """initial E-step dual temperature"""
-    temperature_lr: float = 3e-4
+    temperature_lr: float = 1e-2
     """temperature optimizer learning rate"""
-    lambda_init: float = 1.0
-    """initial M-step dual variable"""
-    lambda_lr: float = 3e-4
+    lambda_mean_init: float = 10.0
+    """initial M-step dual variable for the mean KL constraint"""
+    lambda_std_init: float = 1000.0
+    """initial M-step dual variable for the std KL constraint"""
+    lambda_lr: float = 1e-2
     """M-step dual optimizer learning rate"""
 
     action_samples: int = 20
@@ -99,7 +103,6 @@ class Args:
     max_grad_norm: float = 1.0
     """max gradient norm for clipping"""
 
-    # Optional retrace targets
     use_retrace: bool = False
     """whether to use Retrace targets"""
     retrace_steps: int = 2
@@ -147,9 +150,6 @@ class LayerNormMLP(nn.Module):
         self, in_dim: int, layer_sizes: Tuple[int, ...], activate_final: bool = False
     ):
         super().__init__()
-        if len(layer_sizes) < 1:
-            raise ValueError("layer_sizes must have at least one layer")
-
         layers: list[nn.Module] = [
             nn.Linear(in_dim, layer_sizes[0]),
             nn.LayerNorm(layer_sizes[0]),
@@ -277,28 +277,6 @@ class DiagonalGaussianPolicy(nn.Module):
         _, actions_exec = self.sample_actions_raw_and_exec(obs, num_actions)
         return actions_exec
 
-
-@dataclass
-class MPOConfig:
-    gamma: float = 0.99
-    tau: float = 0.005
-    policy_lr: float = 3e-4
-    q_lr: float = 3e-4
-    kl_epsilon: float = 0.1
-    mstep_kl_epsilon: float = 0.1
-    per_dim_constraining: bool = True
-    temperature_init: float = 1.0
-    temperature_lr: float = 3e-4
-    lambda_init: float = 1.0
-    lambda_lr: float = 3e-4
-    max_grad_norm: float = 1.0
-    action_samples: int = 20
-    use_retrace: bool = False
-    retrace_steps: int = 2
-    retrace_mc_actions: int = 8
-    retrace_lambda: float = 0.95
-
-
 class MPOReplayBuffer:
     def __init__(self, obs_dim: int, act_dim: int, capacity: int):
         self.capacity = capacity
@@ -347,11 +325,6 @@ class MPOReplayBuffer:
         }
 
     def sample_sequences(self, batch_size: int, seq_len: int) -> dict:
-        if seq_len < 1:
-            raise ValueError("seq_len must be >= 1")
-        if self.size < seq_len:
-            raise ValueError("Not enough data in replay buffer for sequence sampling")
-
         obs_dim = self.obs.shape[-1]
         act_dim = self.actions_exec.shape[-1]
 
@@ -404,11 +377,6 @@ class MPOReplayBuffer:
             beh_logp_b[filled] = self.behaviour_logp[idxs]
             filled += 1
 
-        if filled < batch_size:
-            raise RuntimeError(
-                "Failed to sample enough contiguous sequences; consider increasing replay size or reducing seq_len."
-            )
-
         return {
             "obs": obs_b,
             "actions_exec": actions_exec_b,
@@ -430,10 +398,10 @@ class MPOAgent:
         device: torch.device,
         policy_layer_sizes: Tuple[int, ...],
         critic_layer_sizes: Tuple[int, ...],
-        config: MPOConfig,
+        args: Args,
     ):
         self.device = device
-        self.config = config
+        self.args = args
 
         self.policy = DiagonalGaussianPolicy(
             obs_dim,
@@ -465,38 +433,44 @@ class MPOAgent:
         self.q2_target.eval()
 
         self.policy_opt = optim.Adam(
-            self.policy.parameters(), lr=self.config.policy_lr, eps=1e-5
+            self.policy.parameters(), lr=self.args.policy_lr, eps=1e-5
         )
         self.q_opt = optim.Adam(
             list(self.q1.parameters()) + list(self.q2.parameters()),
-            lr=self.config.q_lr,
+            lr=self.args.q_lr,
             eps=1e-5,
         )
 
-        temperature_init_t = torch.tensor(self.config.temperature_init, device=device)
+        temperature_init_t = torch.tensor(self.args.temperature_init, device=device)
         temperature_init_t = torch.clamp(temperature_init_t, min=1e-8)
         self.log_temperature = nn.Parameter(torch.log(torch.expm1(temperature_init_t)))
 
-        lambda_init_t = torch.tensor(self.config.lambda_init, device=device)
-        lambda_init_t = torch.clamp(lambda_init_t, min=1e-8)
-        dual_shape = (act_dim,) if self.config.per_dim_constraining else (1,)
-        init_log = torch.log(torch.expm1(lambda_init_t)).item()
+        lambda_mean_init_t = torch.tensor(
+            self.args.lambda_mean_init, device=device
+        )
+        lambda_mean_init_t = torch.clamp(lambda_mean_init_t, min=1e-8)
+        lambda_std_init_t = torch.tensor(self.args.lambda_std_init, device=device)
+        lambda_std_init_t = torch.clamp(lambda_std_init_t, min=1e-8)
+        dual_shape = (act_dim,) if self.args.per_dim_constraining else (1,)
+        init_log_mean = torch.log(torch.expm1(lambda_mean_init_t)).item()
+        init_log_std = torch.log(torch.expm1(lambda_std_init_t)).item()
         self.log_alpha_mean = nn.Parameter(
-            torch.full(dual_shape, init_log, device=device)
+            torch.full(dual_shape, init_log_mean, device=device)
         )
         self.log_alpha_stddev = nn.Parameter(
-            torch.full(dual_shape, init_log, device=device)
+            torch.full(dual_shape, init_log_std, device=device)
         )
 
         temperature_params = [self.log_temperature]
         alpha_params = [self.log_alpha_mean, self.log_alpha_stddev]
         self.dual_opt = optim.Adam(
             [
-                {"params": temperature_params, "lr": self.config.temperature_lr},
-                {"params": alpha_params, "lr": self.config.lambda_lr},
+                {"params": temperature_params, "lr": self.args.temperature_lr},
+                {"params": alpha_params, "lr": self.args.lambda_lr},
             ],
             eps=1e-5,
         )
+        self.num_updates = 0
 
     def state_dict(self) -> dict[str, dict | torch.Tensor]:
         state = {
@@ -583,15 +557,10 @@ class MPOAgent:
         integrand = torch.log(n * weights + 1e-8)
         return (weights * integrand).sum(dim=1)
 
-    def act_batch_with_logp(
+    def act_with_logp(
         self, obs: np.ndarray, deterministic: bool = False
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        obs = np.asarray(obs, dtype=np.float32)
-        if obs.ndim != 2:
-            raise ValueError(
-                "act_batch_with_logp expects obs with shape (batch_size, obs_dim)"
-            )
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             mean, log_std = self.policy(obs_t)
             action_raw, action_exec = self.policy.sample_action_raw_and_exec(
@@ -599,41 +568,30 @@ class MPOAgent:
             )
             logp = self.policy.log_prob(mean, log_std, action_raw)
         return (
-            action_exec.detach().cpu().numpy(),
-            action_raw.detach().cpu().numpy(),
-            logp.detach().cpu().numpy().squeeze(-1),
+            action_exec.detach().cpu().numpy().squeeze(0),
+            action_raw.detach().cpu().numpy().squeeze(0),
+            float(logp.item()),
         )
 
-    def act_with_logp(
-        self, obs: np.ndarray, deterministic: bool = False
-    ) -> tuple[np.ndarray, np.ndarray, float]:
-        obs = np.asarray(obs, dtype=np.float32)
-        if obs.ndim != 1:
-            raise ValueError("act_with_logp expects obs with shape (obs_dim,)")
-        action_exec, action_raw, logp = self.act_batch_with_logp(
-            obs[None, :], deterministic=deterministic
-        )
-        return action_exec[0], action_raw[0], float(logp[0])
-
-    def act(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
-        action_exec, _, _ = self.act_with_logp(obs, deterministic=deterministic)
+    def act(self, obs: np.ndarray) -> np.ndarray:
+        action_exec, _, _ = self.act_with_logp(obs)
         return action_exec
 
     def _expected_q_current(self, obs: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             actions = self.policy_target.sample_actions(
-                obs, num_actions=self.config.retrace_mc_actions
+                obs, num_actions=self.args.retrace_mc_actions
             )
             batch_size = obs.shape[0]
             obs_rep = obs.unsqueeze(1).expand(
-                batch_size, self.config.retrace_mc_actions, obs.shape[-1]
+                batch_size, self.args.retrace_mc_actions, obs.shape[-1]
             )
             obs_flat = obs_rep.reshape(-1, obs.shape[-1])
             act_flat = actions.reshape(-1, actions.shape[-1])
             q1 = self.q1_target(obs_flat, act_flat)
             q2 = self.q2_target(obs_flat, act_flat)
             q = torch.min(q1, q2)
-            return q.reshape(batch_size, self.config.retrace_mc_actions).mean(
+            return q.reshape(batch_size, self.args.retrace_mc_actions).mean(
                 dim=1, keepdim=True
             )
 
@@ -673,7 +631,7 @@ class MPOAgent:
                 batch_size, seq_len, 1
             )
 
-            delta = rewards_seq + (1.0 - dones_seq) * self.config.gamma * v_next - q_t
+            delta = rewards_seq + (1.0 - dones_seq) * self.args.gamma * v_next - q_t
 
             mean, log_std = self.policy_target(obs_flat)
             actions_raw_flat = actions_raw_seq.reshape(batch_size * seq_len, act_dim)
@@ -682,7 +640,7 @@ class MPOAgent:
             ).reshape(batch_size, seq_len, 1)
             log_ratio = log_pi - behaviour_logp_seq
             rho = torch.exp(log_ratio).squeeze(-1)
-            c = self.config.retrace_lambda * torch.minimum(torch.ones_like(rho), rho)
+            c = self.args.retrace_lambda * torch.minimum(torch.ones_like(rho), rho)
 
             q_ret = q_t[:, 0, :].clone()
             cont = torch.ones((batch_size, 1), device=self.device)
@@ -694,7 +652,7 @@ class MPOAgent:
                 if t > 0:
                     cont = cont * (1.0 - dones_flat[:, t - 1 : t])
                     c_prod = c_prod * c[:, t : t + 1]
-                    discount = discount * self.config.gamma
+                    discount = discount * self.args.gamma
                 q_ret = q_ret + cont * discount * c_prod * delta[:, t, :]
 
         return q_ret
@@ -705,9 +663,9 @@ class MPOAgent:
         )
 
         if (
-            self.config.use_retrace
+            self.args.use_retrace
             and is_sequence_batch
-            and self.config.retrace_steps > 1
+            and self.args.retrace_steps > 1
         ):
             target = self._retrace_q_target(batch)
             obs = torch.tensor(
@@ -733,11 +691,11 @@ class MPOAgent:
 
             with torch.no_grad():
                 next_actions = self.policy_target.sample_actions(
-                    next_obs, num_actions=self.config.action_samples
+                    next_obs, num_actions=self.args.action_samples
                 )
                 batch_size = next_obs.shape[0]
                 next_obs_rep = next_obs.unsqueeze(1).expand(
-                    batch_size, self.config.action_samples, next_obs.shape[-1]
+                    batch_size, self.args.action_samples, next_obs.shape[-1]
                 )
                 next_obs_flat = next_obs_rep.reshape(-1, next_obs.shape[-1])
                 next_act_flat = next_actions.reshape(-1, next_actions.shape[-1])
@@ -745,10 +703,10 @@ class MPOAgent:
                 q2_target = self.q2_target(next_obs_flat, next_act_flat)
                 q_target = (
                     torch.min(q1_target, q2_target)
-                    .reshape(batch_size, self.config.action_samples)
+                    .reshape(batch_size, self.args.action_samples)
                     .mean(dim=1, keepdim=True)
                 )
-                target = rewards + (1.0 - dones) * self.config.gamma * q_target
+                target = rewards + (1.0 - dones) * self.args.gamma * q_target
 
         q1 = self.q1(obs, actions)
         q2 = self.q2(obs, actions)
@@ -760,12 +718,12 @@ class MPOAgent:
         q_loss.backward()
         nn.utils.clip_grad_norm_(
             list(self.q1.parameters()) + list(self.q2.parameters()),
-            self.config.max_grad_norm,
+            self.args.max_grad_norm,
         )
         self.q_opt.step()
 
         batch_size = obs.shape[0]
-        num_samples = self.config.action_samples
+        num_samples = self.args.action_samples
 
         mean_online, log_std_online = self.policy(obs)
         with torch.no_grad():
@@ -786,13 +744,13 @@ class MPOAgent:
 
         temperature = F.softplus(self.log_temperature) + 1e-8
         weights, loss_temperature = self._compute_weights_and_temperature_loss(
-            q_vals, self.config.kl_epsilon, temperature
+            q_vals, self.args.kl_epsilon, temperature
         )
 
         penalty_kl_rel = torch.tensor(0.0, device=self.device)
 
         kl_nonparametric = self._compute_nonparametric_kl_from_weights(weights)
-        kl_q_rel = kl_nonparametric.mean() / float(self.config.kl_epsilon)
+        kl_q_rel = kl_nonparametric.mean() / float(self.args.kl_epsilon)
 
         std_online = torch.exp(log_std_online)
         std_target = torch.exp(log_std_target)
@@ -818,7 +776,7 @@ class MPOAgent:
         loss_policy_std = -(weights * log_prob_fixed_mean).sum(dim=1).mean()
         loss_policy = loss_policy_mean + loss_policy_std
 
-        if self.config.per_dim_constraining:
+        if self.args.per_dim_constraining:
             kl_mean = self._kl_diag_gaussian_per_dim(
                 mean_target.detach(),
                 log_std_target.detach(),
@@ -856,10 +814,10 @@ class MPOAgent:
         loss_kl_penalty = loss_kl_mean + loss_kl_std
 
         loss_alpha_mean = (
-            alpha_mean * (self.config.mstep_kl_epsilon - mean_kl_mean.detach())
+            alpha_mean * (self.args.mstep_kl_epsilon - mean_kl_mean.detach())
         ).sum()
         loss_alpha_std = (
-            alpha_std * (self.config.mstep_kl_epsilon - mean_kl_std.detach())
+            alpha_std * (self.args.mstep_kl_epsilon - mean_kl_std.detach())
         ).sum()
 
         dual_loss = loss_temperature + loss_alpha_mean + loss_alpha_std
@@ -870,18 +828,21 @@ class MPOAgent:
             for p in [self.log_temperature, self.log_alpha_mean, self.log_alpha_stddev]
             if p is not None
         ]
-        nn.utils.clip_grad_norm_(dual_params, self.config.max_grad_norm)
+        nn.utils.clip_grad_norm_(dual_params, self.args.max_grad_norm)
         self.dual_opt.step()
 
         policy_total_loss = loss_policy + loss_kl_penalty
         self.policy_opt.zero_grad()
         policy_total_loss.backward()
-        nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm)
+        nn.utils.clip_grad_norm_(self.policy.parameters(), self.args.max_grad_norm)
         self.policy_opt.step()
 
-        self._soft_update_module(self.q1, self.q1_target)
-        self._soft_update_module(self.q2, self.q2_target)
-        self._soft_update_module(self.policy, self.policy_target)
+        self.num_updates += 1
+        if self.num_updates % self.args.target_critic_update_period == 0:
+            self._hard_update_module(self.q1, self.q1_target)
+            self._hard_update_module(self.q2, self.q2_target)
+        if self.num_updates % self.args.target_policy_update_period == 0:
+            self._hard_update_module(self.policy, self.policy_target)
 
         temperature_val = float(
             (F.softplus(self.log_temperature) + 1e-8).detach().item()
@@ -914,22 +875,16 @@ class MPOAgent:
             "penalty_kl/q_pi": float(penalty_kl_rel.detach().item()),
         }
 
-    def _soft_update_module(self, net: nn.Module, target: nn.Module) -> None:
-        tau = self.config.tau
-        with torch.no_grad():
-            for param, target_param in zip(net.parameters(), target.parameters()):
-                target_param.data.mul_(1.0 - tau)
-                target_param.data.add_(tau * param.data)
+    @staticmethod
+    def _hard_update_module(net: nn.Module, target: nn.Module) -> None:
+        target.load_state_dict(net.state_dict())
 
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    if args.num_envs < 1:
-        raise ValueError("num_envs must be >= 1")
-    if args.use_retrace and args.retrace_steps > 1 and args.num_envs > 1:
+    if args.num_envs != 1:
         raise ValueError(
-            "Retrace sequence sampling is currently supported only with --num-envs 1 "
-            "in mpo_continuous_action.py."
+            "mpo_continuous_action.py currently supports --num-envs 1 only"
         )
 
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -961,119 +916,82 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    envs = gym.vector.SyncVectorEnv(
-        [
-            make_env(args.env_id, i, args.capture_video, run_name, args.gamma)
-            for i in range(args.num_envs)
-        ]
-    )
-    if not isinstance(envs.single_action_space, gym.spaces.Box):
+    env = make_env(
+        args.env_id,
+        idx=0,
+        capture_video=args.capture_video,
+        run_name=run_name,
+        gamma=args.gamma
+    )()
+    if not isinstance(env.action_space, gym.spaces.Box):
         raise ValueError("MPO only supports continuous action spaces")
-    if envs.single_action_space.shape is None:
+    if env.action_space.shape is None:
         raise ValueError("Action space has no shape")
 
-    obs_dim = infer_obs_dim(envs.single_observation_space)
-    act_dim = int(np.prod(envs.single_action_space.shape))
-
-    config = MPOConfig(
-        gamma=args.gamma,
-        tau=args.tau,
-        policy_lr=args.policy_lr,
-        q_lr=args.q_lr,
-        kl_epsilon=args.kl_epsilon,
-        mstep_kl_epsilon=args.mstep_kl_epsilon,
-        per_dim_constraining=args.per_dim_constraining,
-        temperature_init=args.temperature_init,
-        temperature_lr=args.temperature_lr,
-        lambda_init=args.lambda_init,
-        lambda_lr=args.lambda_lr,
-        max_grad_norm=args.max_grad_norm,
-        action_samples=args.action_samples,
-        use_retrace=args.use_retrace,
-        retrace_steps=args.retrace_steps,
-        retrace_mc_actions=args.retrace_mc_actions,
-        retrace_lambda=args.retrace_lambda,
-    )
+    obs_dim = infer_obs_dim(env.observation_space)
+    act_dim = int(np.prod(env.action_space.shape))
 
     agent = MPOAgent(
         obs_dim=obs_dim,
         act_dim=act_dim,
-        action_low=envs.single_action_space.low,
-        action_high=envs.single_action_space.high,
+        action_low=env.action_space.low,
+        action_high=env.action_space.high,
         device=device,
         policy_layer_sizes=args.policy_layer_sizes,
         critic_layer_sizes=args.critic_layer_sizes,
-        config=config,
+        args=args,
     )
     replay = MPOReplayBuffer(
         obs_dim=obs_dim, act_dim=act_dim, capacity=args.buffer_size
     )
 
-    obs, _ = envs.reset(seed=args.seed)
-    global_step = 0
+    obs, _ = env.reset(seed=args.seed)
+    episode_return = 0.0
+    episode_length = 0
     train_start_time: float | None = None
     update_step = 0
-    next_sps_log_step = args.learning_starts + 100
-    next_eval_step: int | None = None
-    if args.eval_interval > 0:
-        next_eval_step = max(args.eval_interval, args.learning_starts)
-        if next_eval_step % args.eval_interval != 0:
-            next_eval_step = (
-                (next_eval_step // args.eval_interval) + 1
-            ) * args.eval_interval
-    num_updates_per_collect = int(args.updates_per_step * args.num_envs)
 
     try:
-        while global_step < args.total_timesteps:
-            if global_step < args.learning_starts:
-                action_exec = envs.action_space.sample().astype(np.float32)
-                action_raw = np.copy(action_exec)
-                behaviour_logp = np.zeros(args.num_envs, dtype=np.float32)
-            else:
-                action_exec, action_raw, behaviour_logp = agent.act_batch_with_logp(
-                    obs, deterministic=False
-                )
-
-            next_obs, reward, terminated, truncated, infos = envs.step(action_exec)
-            dones = np.logical_or(terminated, truncated)
-
-            for env_idx in range(args.num_envs):
-                replay.add(
-                    obs=obs[env_idx],
-                    action_exec=action_exec[env_idx],
-                    action_raw=action_raw[env_idx],
-                    behaviour_logp=float(behaviour_logp[env_idx]),
-                    reward=float(reward[env_idx]),
-                    next_obs=next_obs[env_idx],
-                    done=float(dones[env_idx]),
-                )
-            obs = next_obs
-            global_step += args.num_envs
-
+        for global_step in range(1, args.total_timesteps + 1):
             if train_start_time is None and global_step >= args.learning_starts:
                 train_start_time = time.time()
 
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        episode_return = float(
-                            np.asarray(info["episode"]["r"]).reshape(-1)[0]
-                        )
-                        episode_length = int(
-                            np.asarray(info["episode"]["l"]).reshape(-1)[0]
-                        )
-                        print(
-                            f"global_step={global_step}, episodic_return={episode_return}"
-                        )
-                        writer.add_scalar(
-                            "charts/episodic_return", episode_return, global_step
-                        )
-                        writer.add_scalar(
-                            "charts/episodic_length", episode_length, global_step
-                        )
+            if global_step < args.learning_starts:
+                action_exec = env.action_space.sample().astype(np.float32)
+                action_raw = np.copy(action_exec)
+                behaviour_logp = 0.0
+            else:
+                action_exec, action_raw, behaviour_logp = agent.act_with_logp(
+                    obs, deterministic=False
+                )
+
+            next_obs, reward, terminated, truncated, _ = env.step(action_exec)
+            reward_f = float(reward)
+            done = float(terminated or truncated)
+
+            replay.add(
+                obs=obs,
+                action_exec=action_exec,
+                action_raw=action_raw,
+                behaviour_logp=behaviour_logp,
+                reward=reward_f,
+                next_obs=next_obs,
+                done=done,
+            )
+            obs = next_obs
+            episode_return += reward_f
+            episode_length += 1
+
+            if terminated or truncated:
+                print(f"global_step={global_step}, episodic_return={episode_return}")
+                writer.add_scalar("charts/episodic_return", episode_return, global_step)
+                writer.add_scalar("charts/episodic_length", episode_length, global_step)
+                obs, _ = env.reset()
+                episode_return = 0.0
+                episode_length = 0
 
             if global_step >= args.learning_starts and replay.size >= args.batch_size:
-                for _ in range(num_updates_per_collect):
+                for _ in range(int(args.updates_per_step)):
                     if args.use_retrace and args.retrace_steps > 1:
                         if replay.size < args.batch_size + args.retrace_steps:
                             continue
@@ -1088,17 +1006,20 @@ if __name__ == "__main__":
                     for key, value in metrics.items():
                         writer.add_scalar(key, value, update_step)
 
-            if train_start_time is not None and global_step >= next_sps_log_step:
+            if (
+                global_step >= args.learning_starts
+                and global_step % 100 == 0
+                and train_start_time is not None
+            ):
                 train_env_steps = global_step - args.learning_starts
                 sps = int(train_env_steps / max(1e-8, time.time() - train_start_time))
                 print("SPS:", sps)
                 writer.add_scalar("charts/SPS", sps, global_step)
-                next_sps_log_step = global_step + 100
 
             if (
-                next_eval_step is not None
+                args.eval_interval > 0
                 and global_step >= args.learning_starts
-                and global_step >= next_eval_step
+                and global_step % args.eval_interval == 0
             ):
                 eval_metrics = evaluate(
                     agent=agent,
@@ -1115,8 +1036,6 @@ if __name__ == "__main__":
                     f"mean={eval_metrics['eval/return_mean']:.3f} "
                     f"std={eval_metrics['eval/return_std']:.3f}"
                 )
-                while next_eval_step is not None and next_eval_step <= global_step:
-                    next_eval_step += args.eval_interval
 
         if args.save_model:
             model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
@@ -1154,5 +1073,5 @@ if __name__ == "__main__":
                 )
 
     finally:
-        envs.close()
+        env.close()
         writer.close()

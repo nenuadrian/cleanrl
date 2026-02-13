@@ -30,7 +30,7 @@ def evaluate(
             obs, _ = eval_envs.reset(seed=seed)
 
             while len(returns) < n_episodes:
-                action, _, _, _ = agent.act(obs, deterministic=False)
+                action, _, _, _ = agent.act(obs)
                 action = np.clip(
                     action,
                     eval_envs.single_action_space.low,
@@ -66,7 +66,7 @@ def evaluate(
                 obs, _ = eval_env.reset(seed=seed + i)
                 done = False
                 while not done:
-                    action = agent.act(obs, deterministic=False)
+                    action = agent.act(obs)
                     obs, _, terminated, truncated, info = eval_env.step(action)
                     done = bool(terminated or truncated)
                 if "episode" in info:
