@@ -1,4 +1,5 @@
 import copy
+from contextlib import nullcontext
 import math
 import os
 import random
@@ -87,13 +88,13 @@ class Args:
     per_dim_constraining: bool = True
     """whether to apply per-dimension KL constraints in M-step"""
 
-    temperature_init: float = 1.0
+    temperature_init: float = 10.0
     """initial E-step dual temperature"""
     temperature_lr: float = 1e-2
     """temperature optimizer learning rate"""
     lambda_mean_init: float = 10.0
     """initial M-step dual variable for the mean KL constraint"""
-    lambda_std_init: float = 1000.0
+    lambda_std_init: float = 10.0
     """initial M-step dual variable for the std KL constraint"""
     lambda_lr: float = 1e-2
     """M-step dual optimizer learning rate"""
@@ -120,7 +121,9 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
+        env = gym.wrappers.FlattenObservation(
+            env
+        )  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
@@ -136,12 +139,8 @@ def infer_obs_dim(obs_space: gym.Space) -> int:
     if isinstance(obs_space, gym.spaces.Dict):
         dims = []
         for v in obs_space.spaces.values():
-            if v.shape is None:
-                raise ValueError("Observation space has no shape.")
             dims.append(int(np.prod(v.shape)))
         return int(sum(dims))
-    if obs_space.shape is None:
-        raise ValueError("Observation space has no shape.")
     return int(np.prod(obs_space.shape))
 
 
@@ -276,6 +275,7 @@ class DiagonalGaussianPolicy(nn.Module):
     def sample_actions(self, obs: torch.Tensor, num_actions: int) -> torch.Tensor:
         _, actions_exec = self.sample_actions_raw_and_exec(obs, num_actions)
         return actions_exec
+
 
 class MPOReplayBuffer:
     def __init__(self, obs_dim: int, act_dim: int, capacity: int):
@@ -413,30 +413,21 @@ class MPOAgent:
         self.policy_target = copy.deepcopy(self.policy).to(device)
         self.policy_target.eval()
 
-        self.q1 = Critic(
+        self.q = Critic(
             obs_dim,
             act_dim,
             layer_sizes=critic_layer_sizes,
             action_low=action_low,
             action_high=action_high,
         ).to(device)
-        self.q2 = Critic(
-            obs_dim,
-            act_dim,
-            layer_sizes=critic_layer_sizes,
-            action_low=action_low,
-            action_high=action_high,
-        ).to(device)
-        self.q1_target = copy.deepcopy(self.q1).to(device)
-        self.q2_target = copy.deepcopy(self.q2).to(device)
-        self.q1_target.eval()
-        self.q2_target.eval()
+        self.q_target = copy.deepcopy(self.q).to(device)
+        self.q_target.eval()
 
         self.policy_opt = optim.Adam(
             self.policy.parameters(), lr=self.args.policy_lr, eps=1e-5
         )
         self.q_opt = optim.Adam(
-            list(self.q1.parameters()) + list(self.q2.parameters()),
+            self.q.parameters(),
             lr=self.args.q_lr,
             eps=1e-5,
         )
@@ -445,9 +436,7 @@ class MPOAgent:
         temperature_init_t = torch.clamp(temperature_init_t, min=1e-8)
         self.log_temperature = nn.Parameter(torch.log(torch.expm1(temperature_init_t)))
 
-        lambda_mean_init_t = torch.tensor(
-            self.args.lambda_mean_init, device=device
-        )
+        lambda_mean_init_t = torch.tensor(self.args.lambda_mean_init, device=device)
         lambda_mean_init_t = torch.clamp(lambda_mean_init_t, min=1e-8)
         lambda_std_init_t = torch.tensor(self.args.lambda_std_init, device=device)
         lambda_std_init_t = torch.clamp(lambda_std_init_t, min=1e-8)
@@ -476,10 +465,8 @@ class MPOAgent:
         state = {
             "policy": self.policy.state_dict(),
             "policy_target": self.policy_target.state_dict(),
-            "q1": self.q1.state_dict(),
-            "q2": self.q2.state_dict(),
-            "q1_target": self.q1_target.state_dict(),
-            "q2_target": self.q2_target.state_dict(),
+            "q": self.q.state_dict(),
+            "q_target": self.q_target.state_dict(),
             "log_temperature": self.log_temperature.detach().cpu(),
             "log_alpha_mean": self.log_alpha_mean.detach().cpu(),
             "log_alpha_stddev": self.log_alpha_stddev.detach().cpu(),
@@ -489,10 +476,8 @@ class MPOAgent:
     def load_state_dict(self, state_dict: dict[str, dict | torch.Tensor]) -> None:
         self.policy.load_state_dict(state_dict["policy"])
         self.policy_target.load_state_dict(state_dict["policy_target"])
-        self.q1.load_state_dict(state_dict["q1"])
-        self.q2.load_state_dict(state_dict["q2"])
-        self.q1_target.load_state_dict(state_dict["q1_target"])
-        self.q2_target.load_state_dict(state_dict["q2_target"])
+        self.q.load_state_dict(state_dict["q"])
+        self.q_target.load_state_dict(state_dict["q_target"])
         self.log_temperature.data.copy_(
             torch.as_tensor(state_dict["log_temperature"], device=self.device)
         )
@@ -560,7 +545,9 @@ class MPOAgent:
     def act_with_logp(
         self, obs: np.ndarray, deterministic: bool = False
     ) -> tuple[np.ndarray, np.ndarray, float]:
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(
+            0
+        )
         with torch.no_grad():
             mean, log_std = self.policy(obs_t)
             action_raw, action_exec = self.policy.sample_action_raw_and_exec(
@@ -588,31 +575,29 @@ class MPOAgent:
             )
             obs_flat = obs_rep.reshape(-1, obs.shape[-1])
             act_flat = actions.reshape(-1, actions.shape[-1])
-            q1 = self.q1_target(obs_flat, act_flat)
-            q2 = self.q2_target(obs_flat, act_flat)
-            q = torch.min(q1, q2)
+            q = self.q_target(obs_flat, act_flat)
             return q.reshape(batch_size, self.args.retrace_mc_actions).mean(
                 dim=1, keepdim=True
             )
 
     def _retrace_q_target(self, batch: dict) -> torch.Tensor:
-        obs_seq = torch.tensor(batch["obs"], dtype=torch.float32, device=self.device)
-        actions_exec_seq = torch.tensor(
+        obs_seq = torch.as_tensor(batch["obs"], dtype=torch.float32, device=self.device)
+        actions_exec_seq = torch.as_tensor(
             batch["actions_exec"], dtype=torch.float32, device=self.device
         )
-        actions_raw_seq = torch.tensor(
+        actions_raw_seq = torch.as_tensor(
             batch["actions_raw"], dtype=torch.float32, device=self.device
         )
-        rewards_seq = torch.tensor(
+        rewards_seq = torch.as_tensor(
             batch["rewards"], dtype=torch.float32, device=self.device
         )
-        next_obs_seq = torch.tensor(
+        next_obs_seq = torch.as_tensor(
             batch["next_obs"], dtype=torch.float32, device=self.device
         )
-        dones_seq = torch.tensor(
+        dones_seq = torch.as_tensor(
             batch["dones"], dtype=torch.float32, device=self.device
         )
-        behaviour_logp_seq = torch.tensor(
+        behaviour_logp_seq = torch.as_tensor(
             batch["behaviour_logp"], dtype=torch.float32, device=self.device
         )
 
@@ -622,9 +607,7 @@ class MPOAgent:
         with torch.no_grad():
             obs_flat = obs_seq.reshape(batch_size * seq_len, obs_dim)
             act_exec_flat = actions_exec_seq.reshape(batch_size * seq_len, act_dim)
-            q1_t = self.q1_target(obs_flat, act_exec_flat)
-            q2_t = self.q2_target(obs_flat, act_exec_flat)
-            q_t = torch.min(q1_t, q2_t).reshape(batch_size, seq_len, 1)
+            q_t = self.q_target(obs_flat, act_exec_flat).reshape(batch_size, seq_len, 1)
 
             next_obs_flat = next_obs_seq.reshape(batch_size * seq_len, obs_dim)
             v_next = self._expected_q_current(next_obs_flat).reshape(
@@ -662,30 +645,26 @@ class MPOAgent:
             isinstance(batch.get("obs"), np.ndarray) and batch["obs"].ndim == 3
         )
 
-        if (
-            self.args.use_retrace
-            and is_sequence_batch
-            and self.args.retrace_steps > 1
-        ):
+        if self.args.use_retrace and is_sequence_batch and self.args.retrace_steps > 1:
             target = self._retrace_q_target(batch)
-            obs = torch.tensor(
+            obs = torch.as_tensor(
                 batch["obs"][:, 0, :], dtype=torch.float32, device=self.device
             )
-            actions = torch.tensor(
+            actions = torch.as_tensor(
                 batch["actions_exec"][:, 0, :], dtype=torch.float32, device=self.device
             )
         else:
-            obs = torch.tensor(batch["obs"], dtype=torch.float32, device=self.device)
-            actions = torch.tensor(
+            obs = torch.as_tensor(batch["obs"], dtype=torch.float32, device=self.device)
+            actions = torch.as_tensor(
                 batch["actions"], dtype=torch.float32, device=self.device
             )
-            rewards = torch.tensor(
+            rewards = torch.as_tensor(
                 batch["rewards"], dtype=torch.float32, device=self.device
             )
-            next_obs = torch.tensor(
+            next_obs = torch.as_tensor(
                 batch["next_obs"], dtype=torch.float32, device=self.device
             )
-            dones = torch.tensor(
+            dones = torch.as_tensor(
                 batch["dones"], dtype=torch.float32, device=self.device
             )
 
@@ -699,25 +678,18 @@ class MPOAgent:
                 )
                 next_obs_flat = next_obs_rep.reshape(-1, next_obs.shape[-1])
                 next_act_flat = next_actions.reshape(-1, next_actions.shape[-1])
-                q1_target = self.q1_target(next_obs_flat, next_act_flat)
-                q2_target = self.q2_target(next_obs_flat, next_act_flat)
-                q_target = (
-                    torch.min(q1_target, q2_target)
-                    .reshape(batch_size, self.args.action_samples)
-                    .mean(dim=1, keepdim=True)
-                )
+                q_target = self.q_target(next_obs_flat, next_act_flat).reshape(
+                    batch_size, self.args.action_samples
+                ).mean(dim=1, keepdim=True)
                 target = rewards + (1.0 - dones) * self.args.gamma * q_target
 
-        q1 = self.q1(obs, actions)
-        q2 = self.q2(obs, actions)
-        q1_loss = F.mse_loss(q1, target)
-        q2_loss = F.mse_loss(q2, target)
+        q = self.q(obs, actions)
+        q_loss = F.mse_loss(q, target)
 
-        q_loss = q1_loss + q2_loss
         self.q_opt.zero_grad()
         q_loss.backward()
         nn.utils.clip_grad_norm_(
-            list(self.q1.parameters()) + list(self.q2.parameters()),
+            self.q.parameters(),
             self.args.max_grad_norm,
         )
         self.q_opt.step()
@@ -738,16 +710,14 @@ class MPOAgent:
             act_exec_flat = sampled_actions_exec.reshape(
                 -1, sampled_actions_exec.shape[-1]
             )
-            q1_vals = self.q1_target(obs_flat, act_exec_flat)
-            q2_vals = self.q2_target(obs_flat, act_exec_flat)
-            q_vals = torch.min(q1_vals, q2_vals).reshape(batch_size, num_samples)
+            q_vals = self.q_target(obs_flat, act_exec_flat).reshape(
+                batch_size, num_samples
+            )
 
         temperature = F.softplus(self.log_temperature) + 1e-8
         weights, loss_temperature = self._compute_weights_and_temperature_loss(
             q_vals, self.args.kl_epsilon, temperature
         )
-
-        penalty_kl_rel = torch.tensor(0.0, device=self.device)
 
         kl_nonparametric = self._compute_nonparametric_kl_from_weights(weights)
         kl_q_rel = kl_nonparametric.mean() / float(self.args.kl_epsilon)
@@ -839,8 +809,7 @@ class MPOAgent:
 
         self.num_updates += 1
         if self.num_updates % self.args.target_critic_update_period == 0:
-            self._hard_update_module(self.q1, self.q1_target)
-            self._hard_update_module(self.q2, self.q2_target)
+            self._hard_update_module(self.q, self.q_target)
         if self.num_updates % self.args.target_policy_update_period == 0:
             self._hard_update_module(self.policy, self.policy_target)
 
@@ -852,8 +821,7 @@ class MPOAgent:
         )
 
         return {
-            "loss/q1": float(q1_loss.item()),
-            "loss/q2": float(q2_loss.item()),
+            "loss/q": float(q_loss.item()),
             "loss/policy": float(loss_policy.item()),
             "loss/dual_eta": float(loss_temperature.detach().item()),
             "loss/dual": float(dual_loss.detach().item()),
@@ -872,7 +840,6 @@ class MPOAgent:
             "q/max": float(q_vals.max().detach().item()),
             "pi/std_min": float(std_online.min().detach().item()),
             "pi/std_max": float(std_online.max().detach().item()),
-            "penalty_kl/q_pi": float(penalty_kl_rel.detach().item()),
         }
 
     @staticmethod
@@ -921,7 +888,7 @@ if __name__ == "__main__":
         idx=0,
         capture_video=args.capture_video,
         run_name=run_name,
-        gamma=args.gamma
+        gamma=args.gamma,
     )()
     if not isinstance(env.action_space, gym.spaces.Box):
         raise ValueError("MPO only supports continuous action spaces")
@@ -956,14 +923,9 @@ if __name__ == "__main__":
             if train_start_time is None and global_step >= args.learning_starts:
                 train_start_time = time.time()
 
-            if global_step < args.learning_starts:
-                action_exec = env.action_space.sample().astype(np.float32)
-                action_raw = np.copy(action_exec)
-                behaviour_logp = 0.0
-            else:
-                action_exec, action_raw, behaviour_logp = agent.act_with_logp(
-                    obs, deterministic=False
-                )
+            action_exec, action_raw, behaviour_logp = agent.act_with_logp(
+                obs, deterministic=False
+            )
 
             next_obs, reward, terminated, truncated, _ = env.step(action_exec)
             reward_f = float(reward)
@@ -1033,8 +995,9 @@ if __name__ == "__main__":
                     writer.add_scalar(key, value, global_step)
                 print(
                     f"eval step={global_step} "
-                    f"mean={eval_metrics['eval/return_mean']:.3f} "
-                    f"std={eval_metrics['eval/return_std']:.3f}"
+                    + " ".join(
+                        [f"{key}={value:.2f}" for key, value in eval_metrics.items()]
+                    )
                 )
 
         if args.save_model:
