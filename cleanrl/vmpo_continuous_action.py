@@ -392,7 +392,7 @@ class VMPOAgent:
         obs_t = torch.tensor(obs_np, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             mean, log_std, value = self.policy.forward_all(obs_t)
-            action_t, _ = self.policy.sample_action(mean, log_std, deterministic)
+            action_t, _ = self.policy.sample_action(mean, log_std)
 
         action_np = action_t.cpu().numpy()
         value_np = value.cpu().numpy().squeeze(-1)

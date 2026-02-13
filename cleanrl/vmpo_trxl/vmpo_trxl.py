@@ -352,14 +352,6 @@ class Agent(nn.Module):
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    if not (0.0 < args.vmpo_topk_fraction <= 1.0):
-        raise ValueError("--vmpo_topk_fraction must be in (0, 1].")
-    if args.vmpo_init_eta <= 0.0 or args.vmpo_init_alpha <= 0.0:
-        raise ValueError("--vmpo_init_eta and --vmpo_init_alpha must be > 0.")
-    if args.vmpo_dual_lr <= 0.0:
-        raise ValueError("--vmpo_dual_lr must be > 0.")
-    if args.vmpo_dual_steps < 1:
-        raise ValueError("--vmpo_dual_steps must be >= 1.")
     args.vmpo_min_eta = max(args.vmpo_min_eta, 1e-12)
     args.vmpo_min_alpha = max(args.vmpo_min_alpha, 1e-12)
     args.batch_size = int(args.num_envs * args.num_steps)
