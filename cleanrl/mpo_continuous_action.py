@@ -50,7 +50,7 @@ class Args:
     total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
     num_envs: int = 1
-    """the number of parallel environments (this script currently supports 1)"""
+    """the number of parallel environments"""
     buffer_size: int = 1_000_000
     """the replay memory buffer size"""
     learning_starts: int = 100_000
@@ -583,10 +583,15 @@ class MPOAgent:
         integrand = torch.log(n * weights + 1e-8)
         return (weights * integrand).sum(dim=1)
 
-    def act_with_logp(
+    def act_batch_with_logp(
         self, obs: np.ndarray, deterministic: bool = False
-    ) -> tuple[np.ndarray, np.ndarray, float]:
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        obs = np.asarray(obs, dtype=np.float32)
+        if obs.ndim != 2:
+            raise ValueError(
+                "act_batch_with_logp expects obs with shape (batch_size, obs_dim)"
+            )
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             mean, log_std = self.policy(obs_t)
             action_raw, action_exec = self.policy.sample_action_raw_and_exec(
@@ -594,10 +599,21 @@ class MPOAgent:
             )
             logp = self.policy.log_prob(mean, log_std, action_raw)
         return (
-            action_exec.detach().cpu().numpy().squeeze(0),
-            action_raw.detach().cpu().numpy().squeeze(0),
-            float(logp.item()),
+            action_exec.detach().cpu().numpy(),
+            action_raw.detach().cpu().numpy(),
+            logp.detach().cpu().numpy().squeeze(-1),
         )
+
+    def act_with_logp(
+        self, obs: np.ndarray, deterministic: bool = False
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        obs = np.asarray(obs, dtype=np.float32)
+        if obs.ndim != 1:
+            raise ValueError("act_with_logp expects obs with shape (obs_dim,)")
+        action_exec, action_raw, logp = self.act_batch_with_logp(
+            obs[None, :], deterministic=deterministic
+        )
+        return action_exec[0], action_raw[0], float(logp[0])
 
     def act(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
         action_exec, _, _ = self.act_with_logp(obs, deterministic=deterministic)
@@ -908,9 +924,12 @@ class MPOAgent:
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    if args.num_envs != 1:
+    if args.num_envs < 1:
+        raise ValueError("num_envs must be >= 1")
+    if args.use_retrace and args.retrace_steps > 1 and args.num_envs > 1:
         raise ValueError(
-            "mpo_continuous_action.py currently supports --num-envs 1 only"
+            "Retrace sequence sampling is currently supported only with --num-envs 1 "
+            "in mpo_continuous_action.py."
         )
 
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -942,20 +961,19 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    env = make_env(
-        args.env_id,
-        idx=0,
-        capture_video=args.capture_video,
-        run_name=run_name,
-        gamma=args.gamma
-    )()
-    if not isinstance(env.action_space, gym.spaces.Box):
+    envs = gym.vector.SyncVectorEnv(
+        [
+            make_env(args.env_id, i, args.capture_video, run_name, args.gamma)
+            for i in range(args.num_envs)
+        ]
+    )
+    if not isinstance(envs.single_action_space, gym.spaces.Box):
         raise ValueError("MPO only supports continuous action spaces")
-    if env.action_space.shape is None:
+    if envs.single_action_space.shape is None:
         raise ValueError("Action space has no shape")
 
-    obs_dim = infer_obs_dim(env.observation_space)
-    act_dim = int(np.prod(env.action_space.shape))
+    obs_dim = infer_obs_dim(envs.single_observation_space)
+    act_dim = int(np.prod(envs.single_action_space.shape))
 
     config = MPOConfig(
         gamma=args.gamma,
@@ -980,8 +998,8 @@ if __name__ == "__main__":
     agent = MPOAgent(
         obs_dim=obs_dim,
         act_dim=act_dim,
-        action_low=env.action_space.low,
-        action_high=env.action_space.high,
+        action_low=envs.single_action_space.low,
+        action_high=envs.single_action_space.high,
         device=device,
         policy_layer_sizes=args.policy_layer_sizes,
         critic_layer_sizes=args.critic_layer_sizes,
@@ -991,53 +1009,71 @@ if __name__ == "__main__":
         obs_dim=obs_dim, act_dim=act_dim, capacity=args.buffer_size
     )
 
-    obs, _ = env.reset(seed=args.seed)
-    episode_return = 0.0
-    episode_length = 0
+    obs, _ = envs.reset(seed=args.seed)
+    global_step = 0
     train_start_time: float | None = None
     update_step = 0
+    next_sps_log_step = args.learning_starts + 100
+    next_eval_step: int | None = None
+    if args.eval_interval > 0:
+        next_eval_step = max(args.eval_interval, args.learning_starts)
+        if next_eval_step % args.eval_interval != 0:
+            next_eval_step = (
+                (next_eval_step // args.eval_interval) + 1
+            ) * args.eval_interval
+    num_updates_per_collect = int(args.updates_per_step * args.num_envs)
 
     try:
-        for global_step in range(1, args.total_timesteps + 1):
-            if train_start_time is None and global_step >= args.learning_starts:
-                train_start_time = time.time()
-
+        while global_step < args.total_timesteps:
             if global_step < args.learning_starts:
-                action_exec = env.action_space.sample().astype(np.float32)
+                action_exec = envs.action_space.sample().astype(np.float32)
                 action_raw = np.copy(action_exec)
-                behaviour_logp = 0.0
+                behaviour_logp = np.zeros(args.num_envs, dtype=np.float32)
             else:
-                action_exec, action_raw, behaviour_logp = agent.act_with_logp(
+                action_exec, action_raw, behaviour_logp = agent.act_batch_with_logp(
                     obs, deterministic=False
                 )
 
-            next_obs, reward, terminated, truncated, _ = env.step(action_exec)
-            reward_f = float(reward)
-            done = float(terminated or truncated)
+            next_obs, reward, terminated, truncated, infos = envs.step(action_exec)
+            dones = np.logical_or(terminated, truncated)
 
-            replay.add(
-                obs=obs,
-                action_exec=action_exec,
-                action_raw=action_raw,
-                behaviour_logp=behaviour_logp,
-                reward=reward_f,
-                next_obs=next_obs,
-                done=done,
-            )
+            for env_idx in range(args.num_envs):
+                replay.add(
+                    obs=obs[env_idx],
+                    action_exec=action_exec[env_idx],
+                    action_raw=action_raw[env_idx],
+                    behaviour_logp=float(behaviour_logp[env_idx]),
+                    reward=float(reward[env_idx]),
+                    next_obs=next_obs[env_idx],
+                    done=float(dones[env_idx]),
+                )
             obs = next_obs
-            episode_return += reward_f
-            episode_length += 1
+            global_step += args.num_envs
 
-            if terminated or truncated:
-                print(f"global_step={global_step}, episodic_return={episode_return}")
-                writer.add_scalar("charts/episodic_return", episode_return, global_step)
-                writer.add_scalar("charts/episodic_length", episode_length, global_step)
-                obs, _ = env.reset()
-                episode_return = 0.0
-                episode_length = 0
+            if train_start_time is None and global_step >= args.learning_starts:
+                train_start_time = time.time()
+
+            if "final_info" in infos:
+                for info in infos["final_info"]:
+                    if info and "episode" in info:
+                        episode_return = float(
+                            np.asarray(info["episode"]["r"]).reshape(-1)[0]
+                        )
+                        episode_length = int(
+                            np.asarray(info["episode"]["l"]).reshape(-1)[0]
+                        )
+                        print(
+                            f"global_step={global_step}, episodic_return={episode_return}"
+                        )
+                        writer.add_scalar(
+                            "charts/episodic_return", episode_return, global_step
+                        )
+                        writer.add_scalar(
+                            "charts/episodic_length", episode_length, global_step
+                        )
 
             if global_step >= args.learning_starts and replay.size >= args.batch_size:
-                for _ in range(int(args.updates_per_step)):
+                for _ in range(num_updates_per_collect):
                     if args.use_retrace and args.retrace_steps > 1:
                         if replay.size < args.batch_size + args.retrace_steps:
                             continue
@@ -1052,20 +1088,17 @@ if __name__ == "__main__":
                     for key, value in metrics.items():
                         writer.add_scalar(key, value, update_step)
 
-            if (
-                global_step >= args.learning_starts
-                and global_step % 100 == 0
-                and train_start_time is not None
-            ):
+            if train_start_time is not None and global_step >= next_sps_log_step:
                 train_env_steps = global_step - args.learning_starts
                 sps = int(train_env_steps / max(1e-8, time.time() - train_start_time))
                 print("SPS:", sps)
                 writer.add_scalar("charts/SPS", sps, global_step)
+                next_sps_log_step = global_step + 100
 
             if (
-                args.eval_interval > 0
+                next_eval_step is not None
                 and global_step >= args.learning_starts
-                and global_step % args.eval_interval == 0
+                and global_step >= next_eval_step
             ):
                 eval_metrics = evaluate(
                     agent=agent,
@@ -1082,6 +1115,8 @@ if __name__ == "__main__":
                     f"mean={eval_metrics['eval/return_mean']:.3f} "
                     f"std={eval_metrics['eval/return_std']:.3f}"
                 )
+                while next_eval_step is not None and next_eval_step <= global_step:
+                    next_eval_step += args.eval_interval
 
         if args.save_model:
             model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
@@ -1119,5 +1154,5 @@ if __name__ == "__main__":
                 )
 
     finally:
-        env.close()
+        envs.close()
         writer.close()
