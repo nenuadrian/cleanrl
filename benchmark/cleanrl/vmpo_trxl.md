@@ -1,0 +1,4 @@
+|                      | adrian-research/cleanrl-bench-3/vmpo_trxl ({})   |
+|:---------------------|:-------------------------------------------------|
+| MortarMayhem-Grid-v0 | 0.06 ± 0.00                                      |
+| MortarMayhem-v0      | 0.02 ± 0.00                                      |

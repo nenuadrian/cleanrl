@@ -1,4 +1,10 @@
-,adrian-research/cleanrl-local/vmpo_continuous_action ({})
-Humanoid-v4,7.845389269296023
-HalfCheetah-v4,2.056942635325163
-dm_control/cheetah-run-v0,8.255417304462323
+,adrian-research/cleanrl-bench-3/vmpo_continuous_action ({})
+HalfCheetah-v4,38.81814650636911
+Walker2d-v4,25.93182155812104
+Hopper-v4,23.034046583807875
+Humanoid-v4,28.205572169740776
+dm_control/cheetah-run-v0,34.897013294064635
+dm_control/humanoid-walk-v0,47.86868624493529
+dm_control/humanoid-run-v0,47.38455394953991
+dm_control/walker-walk-v0,40.14238184725596
+dm_control/walker-run-v0,41.22537990781394

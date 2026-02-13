@@ -82,7 +82,7 @@ class Args:
     """E-step KL constraint"""
     mstep_kl_epsilon: float = 0.1
     """M-step KL constraint"""
-    per_dim_constraining: bool = True
+    per_dim_constraining: bool = False
     """whether to apply per-dimension KL constraints in M-step"""
 
     temperature_init: float = 1.0
@@ -100,7 +100,7 @@ class Args:
     """max gradient norm for clipping"""
 
     # Optional retrace targets
-    use_retrace: bool = True
+    use_retrace: bool = False
     """whether to use Retrace targets"""
     retrace_steps: int = 2
     """sequence length for Retrace"""

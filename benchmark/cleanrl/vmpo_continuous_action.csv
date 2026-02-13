@@ -1,4 +1,10 @@
-,adrian-research/cleanrl-local/vmpo_continuous_action ({})
-Humanoid-v4,369.95 ± 124.12
-HalfCheetah-v4,57.94 ± 145.47
-dm_control/cheetah-run-v0,196.00 ± 0.00
+,adrian-research/cleanrl-bench-3/vmpo_continuous_action ({})
+HalfCheetah-v4,1615.30 ± 375.64
+Walker2d-v4,616.14 ± 184.49
+Hopper-v4,578.48 ± 170.76
+Humanoid-v4,597.42 ± 38.14
+dm_control/cheetah-run-v0,280.91 ± 7.11
+dm_control/humanoid-walk-v0,1.35 ± 0.03
+dm_control/humanoid-run-v0,0.85 ± 0.04
+dm_control/walker-walk-v0,231.47 ± 40.30
+dm_control/walker-run-v0,76.10 ± 19.31
