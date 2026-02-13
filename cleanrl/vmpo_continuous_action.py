@@ -59,12 +59,12 @@ class Args:
 
     policy_layer_sizes: tuple[int, ...] = (256, 256)
     """hidden layer sizes for the policy network"""
-    value_layer_sizes: tuple[int, ...] = (256, 256)
+    value_layer_sizes: tuple[int, ...] = (512, 256)
     """hidden layer sizes for the value network"""
 
     gamma: float = 0.99
     """discount factor"""
-    advantage_estimator: Literal["returns", "dae", "gae"] = "gae"
+    advantage_estimator: Literal["returns", "dae", "gae"] = "returns"
     """advantage estimator: `returns` (MC baseline), `dae` (direct TD advantage), or `gae`"""
     gae_lambda: float = 0.95
     """lambda used by GAE when `advantage_estimator=gae`"""

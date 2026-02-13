@@ -66,7 +66,7 @@ class Args:
 
     policy_layer_sizes: tuple[int, ...] = (256, 256)
     """hidden layer sizes for policy network"""
-    critic_layer_sizes: tuple[int, ...] = (256, 256)
+    critic_layer_sizes: tuple[int, ...] = (512, 256)
     """hidden layer sizes for critic network"""
 
     gamma: float = 0.99
